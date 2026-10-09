@@ -101,10 +101,11 @@ class InventoryTests(unittest.TestCase):
         def call(args):
             if args[0]=='session': return {'sessions':[{'name':'default','running':True}]}
             if args[0]=='machine': return []
-            return {'result':{'snapshot':{'agents':[{'agent':'codex','pane_id':'w1:p1','workspace_id':'w1'}],
+            return {'result':{'snapshot':{'agents':[{'agent':'codex','pane_id':'w1:p1','workspace_id':'w1','state_change_seq':7,'focused':True}],
                 'workspaces':[{'workspace_id':'w1','label':'~'}], 'tabs':[], 'panes':[]}}}
         with patch.object(m,'call',side_effect=call): result=m.inventory()
         self.assertEqual(result['agents'][0]['workspace'], '~')
+        self.assertEqual((result['agents'][0]['activity'], result['agents'][0]['focused']), (7, True))
         self.assertEqual(result['machines'][0]['workspaces'], ['~'])
 class WindowsSnapshotTests(unittest.TestCase):
     def test_direct_snapshot_keeps_target_session_and_quotes_executable(self):

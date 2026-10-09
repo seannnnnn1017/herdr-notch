@@ -62,6 +62,14 @@ func appendNotchLog(_ message: String) {
     @Published var updated: Date?
     @Published var refreshing = false
     @Published var focusingID: String?
+    /// Machine whose sessions the list shows; nil shows every machine.
+    @Published var machineFilter: String?
+    var visibleAgents: [Agent] { machineFilter.map { id in agents.filter { $0.machineId == id } } ?? agents }
+    private var recent = RecentActivity(lastUsed: UserDefaults.standard.dictionary(forKey: "lastUsed") as? [String: Double] ?? [:])
+    private func saveRecent() { UserDefaults.standard.set(recent.lastUsed, forKey: "lastUsed") }
+    func toggleFilter(_ machineID: String) {
+        machineFilter = machineFilter == machineID ? nil : machineID
+    }
     @Published var feedback: String?
     @Published var feedbackFailed = false
     var interactionUntil = Date.distantPast
@@ -84,11 +92,13 @@ func appendNotchLog(_ message: String) {
     private func apply(_ event: InventoryEvent) {
         let oldBlocked = Set(agents.filter { $0.status == "blocked" }.map(\.id))
         fleet.apply(event)
-        agents = fleet.agents.sorted { a,b in
-            let rank = ["blocked":0,"working":1,"done":2,"idle":3,"unknown":4]
-            return (rank[a.status] ?? 5, a.id) < (rank[b.status] ?? 5, b.id)
-        }
+        let now = Date().timeIntervalSince1970
+        var changed = recent.observe(fleet.agents, now: now)
+        if event.type == "done" { recent.prune(keeping: Set(fleet.agents.map(\.id)), now: now); changed = true }
+        if changed { saveRecent() }
+        agents = recent.sorted(fleet.agents)
         machines = fleet.machines; errors = fleet.errors; updated = fleet.updated
+        if let filter = machineFilter, !machines.contains(where: { $0.id == filter }) { machineFilter = nil }
         if agents.contains(where: { $0.status == "blocked" && !oldBlocked.contains($0.id) }) {
             NSSound(named: "Glass")?.play()
         }
@@ -161,6 +171,8 @@ func appendNotchLog(_ message: String) {
             return
         }
         focusingID = agent.id
+        recent.touch(agent.id, now: Date().timeIntervalSince1970); saveRecent()
+        agents = recent.sorted(agents)
         Task {
             var handedOff = false
             var succeeded = false
@@ -248,17 +260,26 @@ struct Dashboard: View {
                     }
                     HStack(spacing: 10) {
                         ForEach(model.machines) { machine in
-                            HStack(spacing: 4) {
-                                Circle().fill(machine.state == "online" ? Color.mint : .orange).frame(width: 5, height: 5)
-                                Text("\(machine.label) · \(machine.state == "online" ? "\(machine.agentCount)" : (machine.state == "checking" ? "連線中" : "離線"))")
-                                    .lineLimit(1)
-                            }.font(.system(size: 10, design: .monospaced))
+                            let selected = model.machineFilter == machine.id
+                            Button { withAnimation(.easeOut(duration: 0.15)) { model.toggleFilter(machine.id) } } label: {
+                                HStack(spacing: 4) {
+                                    Circle().fill(machine.state == "online" ? Color.mint : .orange).frame(width: 5, height: 5)
+                                    Text("\(machine.label) · \(machine.state == "online" ? "\(machine.agentCount)" : (machine.state == "checking" ? "連線中" : "離線"))")
+                                        .lineLimit(1)
+                                }.font(.system(size: 10, design: .monospaced))
+                                    .padding(.horizontal, 7).padding(.vertical, 3)
+                                    .background(Color.white.opacity(selected ? 0.16 : 0.0001)).cornerRadius(6)
+                                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(selected ? 0.35 : 0), lineWidth: 1))
+                                    .opacity(model.machineFilter == nil || selected ? 1 : 0.45)
+                            }.buttonStyle(.plain).help(selected ? "顯示所有機器" : "只顯示 \(machine.label)")
+                                .accessibilityLabel(selected ? "取消篩選 \(machine.label)" : "只顯示 \(machine.label)")
                         }
                     }
                     ScrollView {
                         VStack(spacing: 7) {
                             if model.agents.isEmpty { Text(model.errors.isEmpty ? "目前沒有 Herdr Codex / Claude sessions" : "Herdr 尚未連線").foregroundColor(.gray).padding(20) }
-                            ForEach(model.agents) { a in
+                            else if model.visibleAgents.isEmpty { Text("這台機器目前沒有 sessions").foregroundColor(.gray).padding(20) }
+                            ForEach(model.visibleAgents) { a in
                                 Button { model.focus(a) } label: {
                                     HStack(spacing: 10) {
                                         Circle().fill(a.color).frame(width: 7,height: 7)

@@ -19,7 +19,9 @@
 ## 功能
 
 - **跨機器清單**：列出本機 Herdr sessions 與所有啟用的 saved SSH machines（`herdr machine list`）上，Herdr 辨識到的 Codex 與 Claude Code agents，每列標示種類，每 3 秒更新。各機器分開讀取，慢的或離線的機器不會拖住其他機器。
-- **狀態直接來自 Herdr**：工作中、需要回覆（approval／提問）、已完成、待命、未知。出現新的「需要回覆」會播放提示音，並排在最前面。
+- **狀態直接來自 Herdr**：工作中、需要回覆（approval／提問）、已完成、待命、未知。出現新的「需要回覆」會播放提示音。
+- **排序**：先依狀態（需要回覆 → 工作中 → 已完成 → 待命），同狀態再依最後使用時間，最近的在前。Herdr 沒有提供時間戳，所以由瀏海自行記錄：agent 狀態改變、你在 Herdr 切到該 pane、或在瀏海點擊它，都算一次使用；紀錄會保留到下次啟動。
+- **機器篩選**：點機器標籤（例如 `Local · 3`）只顯示那台機器的 sessions，再點一次恢復全部。
 - **一鍵跳轉**：點任一列，Ghostty 裡的 Herdr 就會切到那個 agent 的 pane，即使它在另一台機器上（見[跳轉原理](#跳轉原理)）。
 - **Codex 額度**：每 60 秒透過 `codex app-server` 讀取帳號剩餘額度與重置時間，用短暫的唯讀 process，不建立對話、不呼叫模型。
 - **Claude 額度**：顯示 Claude 訂閱的 5 小時與 7 天用量上限（以及 gateway 的花費上限），資料來自 Claude Code 官方 statusLine 提供的 `rate_limits`，不讀取登入憑證、不呼叫任何 API（見[啟用 Claude 額度](#啟用-claude-額度)）。
@@ -128,6 +130,7 @@ flowchart TD
 ```
 Sources/HerdrNotch/
   main.swift               瀏海視窗、SwiftUI 儀表板、點擊流程
+  RecentActivity.swift     「最後使用」紀錄與排序
   GhosttyNavigation.swift  跳轉：選 terminal、標題確認、逐格切換機器
   ClientView.swift         從視窗標題判斷機器與 workspace
   TerminalChoice.swift     找出跑 Herdr 的 Ghostty terminal
@@ -140,7 +143,7 @@ Resources/claude_statusline.py  Claude Code statusLine 包裝：記錄 rate_limi
 
 ```sh
 python3 -m unittest discover -s tests   # monitor.py 與 statusline 包裝：inventory、遠端逾時、focus、Claude 額度
-./tests/check_navigation.sh             # 標題解析、terminal 選擇、模擬側欄逐格切換
+./tests/check_navigation.sh             # 標題解析、terminal 選擇、模擬側欄逐格切換、最後使用排序
 python3 tests/check_lifecycle.py        # 點擊流程與瀏海收合／還原
 ```
 

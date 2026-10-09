@@ -126,7 +126,7 @@ def inventory(emit=None):
                 kind = agent_kind(a.get('agent'))
                 if kind is None: continue
                 pane = a['pane_id']
-                result.append(dict(id=machine['id']+':'+session+':'+pane, machineId=machine['id'], machine=machine['label'], pane=pane, session=session, title=a.get('terminal_title_stripped') or a.get('name') or pane, cwd=a.get('foreground_cwd') or a.get('cwd') or '', status=a.get('agent_status', 'unknown'), agent=kind, workspace=labels.get(a.get('workspace_id'), '')))
+                result.append(dict(id=machine['id']+':'+session+':'+pane, machineId=machine['id'], machine=machine['label'], pane=pane, session=session, title=a.get('terminal_title_stripped') or a.get('name') or pane, cwd=a.get('foreground_cwd') or a.get('cwd') or '', status=a.get('agent_status', 'unknown'), agent=kind, activity=a.get('state_change_seq'), focused=bool(a.get('focused')), workspace=labels.get(a.get('workspace_id'), '')))
             machine['workspaces'] = sorted(set(labels.values()))
             return machine, session, result, None, snapshot
         except Exception as e:

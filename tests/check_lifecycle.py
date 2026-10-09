@@ -19,6 +19,7 @@ for old, new in {
 assert not re.search(r"\b(?:AXIsProcessTrusted|NSRunningApplication|NSSound|GhosttyNavigation)\b", model)
 assert not re.search(r"\b(?:NSApp|NSApplication|NSWorkspace|AXUIElement|NSAppleScript)\b", model + lifecycle)
 models = (root / "Sources/HerdrNotch/Models.swift").read_text().replace("import SwiftUI", "")
+models += (root / "Sources/HerdrNotch/RecentActivity.swift").read_text().replace("import Foundation", "")
 inventory = (root / "Sources/HerdrNotch/InventoryStream.swift").read_text().split("\nfunc streamInventory(", 1)[0]
 
 stubs = r'''

@@ -6,6 +6,9 @@ struct Agent: Codable, Identifiable {
     var workspace: String?
     /// Herdr agent kind: "codex" or "claude".
     var agent: String?
+    /// Herdr's per-server state_change_seq, and whether the pane is that server's focused pane.
+    var activity: Int?
+    var focused: Bool?
     var kindLabel: String { agent == "claude" ? "Claude" : "Codex" }
     var color: Color { status == "blocked" ? .orange : status == "working" ? .mint : status == "done" ? .cyan : .gray }
     var label: String { ["blocked":"需要你回覆", "working":"工作中", "idle":"待命", "done":"已完成", "unknown":"狀態未知"][status] ?? status }
