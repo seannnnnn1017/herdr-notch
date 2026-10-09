@@ -1,11 +1,11 @@
 # Herdr Notch
 
-把 MacBook 瀏海變成 [Herdr](https://herdr.dev) 裡 Codex agents 的儀表板：一眼看到哪個 agent 在工作、哪個在等你回覆，點一下就跳到那個 pane，本機和 SSH 遠端機器都適用。
+把 MacBook 瀏海變成 [Herdr](https://herdr.dev) 裡 Codex 與 Claude Code agents 的儀表板：一眼看到哪個 agent 在工作、哪個在等你回覆，點一下就跳到那個 pane，本機和 SSH 遠端機器都適用；同時顯示 Codex 與 Claude 的剩餘額度。
 
-*A native macOS notch dashboard for Codex agents running in Herdr, across your Mac and saved SSH machines. Click a row to jump straight to that pane.*
+*A native macOS notch dashboard for Codex and Claude Code agents running in Herdr, across your Mac and saved SSH machines. Click a row to jump straight to that pane; see both tools' remaining usage at a glance.*
 
 <p align="center">
-  <img src="docs/screenshots/dashboard.png" width="720" alt="展開的瀏海儀表板：工作中／需要回覆／sessions 計數、各機器連線狀態、agent 清單與 Codex 剩餘額度">
+  <img src="docs/screenshots/dashboard.png" width="720" alt="展開的瀏海儀表板：工作中／需要回覆／sessions 計數、各機器連線狀態、Codex 與 Claude agent 清單，以及兩者的剩餘額度">
 </p>
 
 收合時只佔瀏海兩側，顯示工作中數量與待回覆數量：
@@ -18,10 +18,11 @@
 
 ## 功能
 
-- **跨機器清單**：列出本機 Herdr sessions 與所有啟用的 saved SSH machines（`herdr machine list`）上辨識到的 Codex agents，每 3 秒更新。各機器分開讀取，慢的或離線的機器不會拖住其他機器。
+- **跨機器清單**：列出本機 Herdr sessions 與所有啟用的 saved SSH machines（`herdr machine list`）上，Herdr 辨識到的 Codex 與 Claude Code agents，每列標示種類，每 3 秒更新。各機器分開讀取，慢的或離線的機器不會拖住其他機器。
 - **狀態直接來自 Herdr**：工作中、需要回覆（approval／提問）、已完成、待命、未知。出現新的「需要回覆」會播放提示音，並排在最前面。
 - **一鍵跳轉**：點任一列，Ghostty 裡的 Herdr 就會切到那個 agent 的 pane，即使它在另一台機器上（見[跳轉原理](#跳轉原理)）。
 - **Codex 額度**：每 60 秒透過 `codex app-server` 讀取帳號剩餘額度與重置時間，用短暫的唯讀 process，不建立對話、不呼叫模型。
+- **Claude 額度**：顯示 Claude 訂閱的 5 小時與 7 天用量上限（以及 gateway 的花費上限），資料來自 Claude Code 官方 statusLine 提供的 `rate_limits`，不讀取登入憑證、不呼叫任何 API（見[啟用 Claude 額度](#啟用-claude-額度)）。
 - **瀏海互動**：滑鼠移入展開，移出 0.2 秒後收合；透明區域不攔截點擊。沒有瀏海的螢幕會放在畫面頂部中央。右鍵選單列圖示可以隱藏或結束。
 
 ## 需求
@@ -29,7 +30,7 @@
 - macOS 13 以上，以及用來編譯的 Swift toolchain（Xcode 或 Command Line Tools）
 - Python 3
 - [Herdr](https://herdr.dev) 0.9.1 以上，跑在 [Ghostty](https://ghostty.org) 裡
-- [Codex CLI](https://github.com/openai/codex)，沿用你現有的登入，不需要 API key
+- [Codex CLI](https://github.com/openai/codex) 和／或 [Claude Code](https://claude.com/claude-code)，沿用你現有的登入，不需要 API key
 
 ## 安裝
 
@@ -61,6 +62,26 @@ previous_workspace = "ctrl+alt+p"
 接著在 Herdr 裡按 `Ctrl+B`、`Shift+R` 重新載入設定。沒有這兩行時，跳到「目前畫面所在的機器」仍然可用；要跳到別台機器，瀏海會提示你先加上設定。
 
 另外請保留 Herdr 預設的視窗標題格式 `ui.window_title = "{hostname}: {workspace}"`，瀏海靠它判斷 Herdr 目前停在哪台機器。
+
+### 啟用 Claude 額度
+
+Claude Code 每次更新 status line 時，會把 session 資訊（含訂閱用量 `rate_limits`）以 JSON 傳給 `statusLine` 指令。Herdr Notch 附了一個包裝腳本：記下用量，再把同一份輸入原封不動交給你原本的 status line 指令，所以你看到的 status line 不會改變。
+
+App 啟動時會把腳本放到 `~/Library/Application Support/Herdr Notch/claude_statusline.py`。在 `~/.claude/settings.json` 設定：
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python3 \"$HOME/Library/Application Support/Herdr Notch/claude_statusline.py\" --wrap 'bash ~/.claude/statusline.sh'"
+  }
+}
+```
+
+`--wrap` 後面放你原本的 status line 指令；沒有的話可以省略，腳本會顯示簡單的「模型 + context 用量」。Claude Code 下一次回應後，瀏海就會出現 Claude 額度。
+
+- `rate_limits` 只有 Claude 訂閱帳號（Pro／Max）才會提供；用 API key 的話這一區會保持空白。
+- 數值是最近一次任何 Claude Code session 回報的值，旁邊的時間就是回報時間；已過重置時間的視窗會自動隱藏。
 
 ## 跳轉原理
 
@@ -97,8 +118,8 @@ flowchart TD
 
 ## 限制
 
-- 只列出跑在 Herdr 裡的 Codex；獨立的 Codex terminal 和 Codex 桌面 app 的對話不會顯示。
-- 額度是這台 Mac 上 Codex CLI 登入帳號的額度；遠端機器若用其他帳號，額度可能不同。
+- 只列出跑在 Herdr 裡的 Codex 與 Claude Code；不在 Herdr 裡的 terminal、Codex 桌面 app、Claude 桌面 app 的對話不會顯示。
+- 額度是這台 Mac 上 Codex CLI／Claude Code 登入帳號的額度；遠端機器若用其他帳號，額度可能不同。Claude 額度只來自本機的 Claude Code sessions。
 - 本機只支援跳到 `default` session（Herdr client 預設連線的 session）。
 - 不會自動核准或替你送出任何 prompt。
 
@@ -111,13 +132,14 @@ Sources/HerdrNotch/
   ClientView.swift         從視窗標題判斷機器與 workspace
   TerminalChoice.swift     找出跑 Herdr 的 Ghostty terminal
   InventoryStream.swift    逐機器合併 inventory 事件
-Resources/monitor.py       Herdr / Codex 唯讀資料橋接（inventory、quota、focus）
+Resources/monitor.py       Herdr / Codex / Claude 唯讀資料橋接（inventory、quota、focus）
+Resources/claude_statusline.py  Claude Code statusLine 包裝：記錄 rate_limits 後執行原本的 status line
 ```
 
 測試全部離線執行，不會操作任何 UI：
 
 ```sh
-python3 -m unittest discover -s tests   # monitor.py：inventory、遠端逾時、focus
+python3 -m unittest discover -s tests   # monitor.py 與 statusline 包裝：inventory、遠端逾時、focus、Claude 額度
 ./tests/check_navigation.sh             # 標題解析、terminal 選擇、模擬側欄逐格切換
 python3 tests/check_lifecycle.py        # 點擊流程與瀏海收合／還原
 ```
@@ -126,7 +148,7 @@ python3 tests/check_lifecycle.py        # 點擊流程與瀏海收合／還原
 
 ```sh
 python3 Resources/monitor.py           # 一次性 inventory
-python3 Resources/monitor.py quota     # Codex 額度
+python3 Resources/monitor.py quota     # Codex 與 Claude 額度
 ```
 
 參考：[Herdr CLI](https://herdr.dev/docs/cli-reference/)、[Herdr socket API](https://herdr.dev/docs/socket-api/)、[Codex app-server](https://learn.chatgpt.com/docs/app-server)

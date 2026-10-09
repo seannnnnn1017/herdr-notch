@@ -25,7 +25,12 @@ stubs = r'''
 import Foundation
 import Combine
 func appendNotchLog(_ message: String) {}
-enum Color { case orange, mint, cyan, gray }
+enum Color {
+    case orange, mint, cyan, gray
+    init(red: Double, green: Double, blue: Double) { self = .orange }
+    init(white: Double) { self = .gray }
+    func opacity(_ value: Double) -> Color { self }
+}
 struct Animation {
     static func easeOut(duration: Double) -> Self { Self() }
     static func easeInOut(duration: Double) -> Self { Self() }

@@ -3,6 +3,9 @@ import SwiftUI
 import QuartzCore
 
 
+/// Expanded dashboard height; the agent list takes whatever quota rows leave.
+let expandedHeight: CGFloat = 600
+
 func bridge(_ args: [String]) async -> Data? {
     await withCheckedContinuation { continuation in
         DispatchQueue.global(qos: .utility).async {
@@ -22,6 +25,18 @@ func bridge(_ args: [String]) async -> Data? {
             } catch { continuation.resume(returning: nil) }
         }
     }
+}
+
+/// Claude Code's statusLine setting needs a path that survives moving or
+/// rebuilding the app, so keep a copy of the bundled wrapper in Application Support.
+func installClaudeStatusline() {
+    guard let source = Bundle.main.url(forResource: "claude_statusline", withExtension: "py"),
+          let data = try? Data(contentsOf: source) else { return }
+    let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Herdr Notch")
+    let target = directory.appendingPathComponent("claude_statusline.py")
+    guard (try? Data(contentsOf: target)) != data else { return }
+    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try? data.write(to: target, options: .atomic)
 }
 
 func appendNotchLog(_ message: String) {
@@ -82,7 +97,12 @@ func appendNotchLog(_ message: String) {
     func refreshQuota() async {
         guard !fetchingQuota else { return }; fetchingQuota = true; defer { fetchingQuota = false }
         if let data = await bridge(["quota"]), let result = try? JSONDecoder().decode(Quota.self, from: data) { quota = result }
-        else { quota = Quota(windows: [], updated: Date().timeIntervalSince1970, error: "無法取得額度") }
+        else {
+            let now = Date().timeIntervalSince1970
+            quota = Quota(providers: ["Codex", "Claude"].map {
+                QuotaProvider(id: $0.lowercased(), label: $0, windows: [], updated: now, error: "無法取得額度")
+            }, updated: now)
+        }
     }
     func setHovered(_ inside: Bool) {
         guard expanded != inside else { return }
@@ -115,7 +135,7 @@ func appendNotchLog(_ message: String) {
             while polling || fetchingQuota || focusingID != nil { try? await Task.sleep(nanoseconds: 50_000_000) }
             await refresh(); await refreshQuota()
             refreshing = false
-            let failed = !errors.isEmpty || quota?.error != nil
+            let failed = !errors.isEmpty || quota?.providers.contains { $0.error != nil } != false
             report(failed ? "更新完成，部分資料無法取得" : "已更新最新狀態", failed: failed)
         }
     }
@@ -211,7 +231,7 @@ struct Dashboard: View {
             if model.expanded {
                 VStack(alignment: .leading, spacing: 14) {
                     HStack {
-                        VStack(alignment: .leading, spacing: 3) { Text("HERDR").font(.system(size: 12, weight: .bold, design: .monospaced)).foregroundColor(.mint); Text("你的 Codex 工作台").font(.system(size: 21, weight: .semibold)) }
+                        VStack(alignment: .leading, spacing: 3) { Text("HERDR").font(.system(size: 12, weight: .bold, design: .monospaced)).foregroundColor(.mint); Text("你的 Agent 工作台").font(.system(size: 21, weight: .semibold)) }
                         Spacer()
                         Button { model.manualRefresh() } label: {
                             Group {
@@ -237,13 +257,18 @@ struct Dashboard: View {
                     }
                     ScrollView {
                         VStack(spacing: 7) {
-                            if model.agents.isEmpty { Text(model.errors.isEmpty ? "目前沒有 Herdr Codex sessions" : "Herdr 尚未連線").foregroundColor(.gray).padding(20) }
+                            if model.agents.isEmpty { Text(model.errors.isEmpty ? "目前沒有 Herdr Codex / Claude sessions" : "Herdr 尚未連線").foregroundColor(.gray).padding(20) }
                             ForEach(model.agents) { a in
                                 Button { model.focus(a) } label: {
                                     HStack(spacing: 10) {
                                         Circle().fill(a.color).frame(width: 7,height: 7)
                                         VStack(alignment: .leading, spacing: 4) {
-                                            Text(a.title).font(.system(size: 13,weight: .medium)).lineLimit(1)
+                                            HStack(spacing: 6) {
+                                                Text(a.kindLabel).font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                                    .foregroundColor(a.kindColor).padding(.horizontal, 5).padding(.vertical, 1)
+                                                    .background(a.kindColor.opacity(0.15)).cornerRadius(4)
+                                                Text(a.title).font(.system(size: 13,weight: .medium)).lineLimit(1)
+                                            }
                                             Text("\(a.machine) · \(a.session) · \(a.pane) · \(a.cwd)").font(.system(size: 10,design: .monospaced)).foregroundColor(.gray).lineLimit(1).truncationMode(.middle)
                                         }
                                         Spacer(minLength: 4)
@@ -257,33 +282,43 @@ struct Dashboard: View {
                                 }.buttonStyle(ResponsiveButtonStyle()).disabled(model.focusingID != nil).help("開啟 \(a.machine) 的原有 Herdr session")
                             }
                         }
-                    }.frame(maxHeight: 174)
+                    }.frame(maxHeight: 254)
                     Divider().overlay(Color.white.opacity(0.1))
-                    HStack { Text("Mac 登入帳號剩餘額度").font(.system(size: 12,weight: .semibold)); Spacer(); if let q = model.quota { Text(Date(timeIntervalSince1970:q.updated), style: .time).font(.system(size: 10)).foregroundColor(.gray) } }
+                    HStack { Text("本機登入帳號剩餘額度").font(.system(size: 12,weight: .semibold)); Spacer() }
                     if let q = model.quota {
-                        if let error = q.error { Text("額度無法取得：\(error)").font(.system(size: 11)).foregroundColor(.orange).lineLimit(2) }
-                        else if q.windows.isEmpty { Text("此帳號未提供配額資料").font(.system(size:11)).foregroundColor(.gray) }
-                        else {
-                            ForEach(q.windows) { w in
-                                VStack(alignment:.leading, spacing:5) {
-                                    HStack { Text(w.label).font(.system(size:11)); Spacer(); Text("\(Int(w.remaining))% 剩餘").font(.system(size:12,weight:.semibold,design:.monospaced)).foregroundColor(w.remaining < 20 ? .orange : .mint) }
-                                    ProgressView(value:w.remaining,total:100).tint(w.remaining < 20 ? .orange : .mint)
-                                    if let reset=w.resetsAt { Text("重置：\(Date(timeIntervalSince1970:reset).formatted(date:.abbreviated,time:.shortened))").font(.system(size:10)).foregroundColor(.gray) }
+                        ForEach(q.providers) { provider in
+                            VStack(alignment: .leading, spacing: 5) {
+                                HStack {
+                                    Text(provider.label).font(.system(size: 11, weight: .semibold)).foregroundColor(provider.id == "claude" ? Agent.claudeColor : .white)
+                                    Spacer()
+                                    if provider.error == nil { Text(Date(timeIntervalSince1970: provider.updated), style: .time).font(.system(size: 10)).foregroundColor(.gray) }
+                                }
+                                if let error = provider.error { Text(error).font(.system(size: 10)).foregroundColor(.orange).lineLimit(2) }
+                                else if provider.windows.isEmpty { Text("目前沒有額度資料").font(.system(size: 10)).foregroundColor(.gray) }
+                                ForEach(provider.windows) { w in
+                                    HStack(spacing: 8) {
+                                        Text(w.label).font(.system(size: 10)).frame(width: 64, alignment: .leading).lineLimit(1)
+                                        ProgressView(value: w.remaining, total: 100).tint(w.remaining < 20 ? .orange : .mint)
+                                        Text("\(Int(w.remaining))%").font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                            .foregroundColor(w.remaining < 20 ? .orange : .mint).frame(width: 38, alignment: .trailing)
+                                        Text(w.resetsAt.map { "重置 " + Date(timeIntervalSince1970: $0).formatted(.dateTime.month(.defaultDigits).day().hour().minute()) } ?? "")
+                                            .font(.system(size: 9)).foregroundColor(.gray).frame(width: 96, alignment: .trailing).lineLimit(1)
+                                    }
                                 }
                             }
                         }
-                    } else { Text("正在讀取 Codex 額度…").font(.system(size:11)).foregroundColor(.gray) }
+                    } else { Text("正在讀取額度…").font(.system(size:11)).foregroundColor(.gray) }
                     ForEach(model.errors,id:\.self) { Text($0).font(.system(size:10)).foregroundColor(.orange).lineLimit(2) }
                     if let feedback = model.feedback {
                         Label(feedback, systemImage: model.feedbackFailed ? "exclamationmark.circle" : "checkmark.circle.fill")
                             .font(.system(size: 11)).foregroundColor(model.feedbackFailed ? .orange : .mint)
                             .lineLimit(1).transition(.opacity)
                     }
-                    Text("各機器分開更新 · 額度每 60 秒更新").font(.system(size:9,design:.monospaced)).foregroundColor(.gray)
+                    Text("各機器分開更新 · 剩餘額度每 60 秒更新").font(.system(size:9,design:.monospaced)).foregroundColor(.gray)
                 }.padding(.horizontal,20).padding(.top,15).padding(.bottom,20)
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
-        }.frame(width: model.expanded ? 480 : model.compactWidth, height: model.expanded ? 520 : 34, alignment: .top)
+        }.frame(width: model.expanded ? 480 : model.compactWidth, height: model.expanded ? expandedHeight : 34, alignment: .top)
             .background(Color.black).foregroundColor(.white)
             .clipShape(UnevenRoundedRectangleCompat())
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -325,6 +360,7 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
     func applicationDidFinishLaunching(_ notification:Notification) {
         NSApp.setActivationPolicy(.accessory)
         appendNotchLog("Started")
+        installClaudeStatusline()
         model.onFeedback = { message, failed in appendNotchLog("\(failed ? "FAILED" : "OK"): \(message)") }
         panel=NotchPanel(contentRect:.zero,styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
         panel.isOpaque=false; panel.backgroundColor = .clear; panel.hasShadow=false; panel.level = .statusBar
@@ -401,7 +437,7 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
     }
     func targetFrame() -> NSRect {
         guard let screen=NSScreen.screens.first(where:{$0.safeAreaInsets.top>0}) ?? NSScreen.main else{return .zero}
-        let height:CGFloat=model.expanded ? 520 : 34, width:CGFloat=model.expanded ? 480 : model.compactWidth
+        let height:CGFloat=model.expanded ? expandedHeight : 34, width:CGFloat=model.expanded ? 480 : model.compactWidth
         return NSRect(x:screen.frame.midX-width/2,y:screen.frame.maxY-height,width:width,height:height)
     }
     func position() {
@@ -412,7 +448,7 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
         } else { model.notchWidth = 0 }
         // Animate only the SwiftUI silhouette in a stationary, top-aligned
         // canvas. Animating both the window frame and layout causes a seam.
-        panel.setFrame(NSRect(x:screen.frame.midX-240,y:screen.frame.maxY-520,width:480,height:520),display:true)
+        panel.setFrame(NSRect(x:screen.frame.midX-240,y:screen.frame.maxY-expandedHeight,width:480,height:expandedHeight),display:true)
     }
     @objc func screenChanged(){position()}
     @objc func menuClick(){

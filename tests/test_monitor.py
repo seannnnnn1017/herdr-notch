@@ -12,13 +12,14 @@ def snapshot(agents):
         'panes': [{'tab_id': 'w1:t1', 'pane_id': a['pane_id']} for a in agents]}}}
 
 class InventoryTests(unittest.TestCase):
-    def test_sessions_are_namespaced_and_non_codex_ignored(self):
+    def test_sessions_are_namespaced_and_other_agent_kinds_ignored(self):
         def call(args):
             if args[0]=='machine': return []
             if args[0]=='session': return {'sessions':[{'name':'a','running':True},{'name':'b','running':True},{'name':'stopped','running':False}]}
-            return snapshot([{'agent':'codex','pane_id':'w1:p1','agent_status':'blocked'},{'agent':'claude','pane_id':'w1:p2'}])
+            return snapshot([{'agent':'codex','pane_id':'w1:p1','agent_status':'blocked'},{'agent':'claude','pane_id':'w1:p2'},{'agent':'gemini','pane_id':'w1:p3'}])
         with patch.object(m,'call',side_effect=call): result=m.inventory()
-        self.assertEqual([a['id'] for a in result['agents']],['local:a:w1:p1','local:b:w1:p1'])
+        self.assertEqual([a['id'] for a in result['agents']],['local:a:w1:p1','local:a:w1:p2','local:b:w1:p1','local:b:w1:p2'])
+        self.assertEqual([a['agent'] for a in result['agents']],['codex','claude','codex','claude'])
         self.assertEqual(result['agents'][0]['status'],'blocked')
     def test_failed_session_preserves_others_and_reports_error(self):
         def call(args):
@@ -216,3 +217,45 @@ class QueryTimeoutTests(unittest.TestCase):
             self.assertTrue(not state or state.startswith('Z'), f'query child still running: {state}')
 
 if __name__=='__main__': unittest.main()
+
+
+class ClaudeUsageTests(unittest.TestCase):
+    def write(self, directory, data):
+        Path(directory, 'claude-usage.json').write_text(json.dumps(data))
+    def test_windows_are_remaining_percentages_and_expired_windows_dropped(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(m, 'STATE', Path(d)):
+            self.write(d, {'updated': 50, 'rate_limits': {
+                'five_hour': {'used_percentage': 23.5, 'resets_at': 90},
+                'seven_day': {'used_percentage': 61, 'resets_at': 500},
+                'spend_limit': {'used_percentage': 120, 'resets_at': 900, 'period': 'weekly'}}})
+            result = m.claude_usage(now=100)
+        self.assertEqual([(w['label'], w['remaining']) for w in result['windows']], [('7 天', 39), ('花費上限 每週', 0)])
+        self.assertEqual(result['updated'], 50)
+    def test_missing_record_explains_setup(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(m, 'STATE', Path(d)):
+            with self.assertRaisesRegex(RuntimeError, 'statusLine'): m.claude_usage()
+    def test_quota_reports_each_provider_independently(self):
+        with patch.object(m, 'codex_quota', side_effect=RuntimeError('Codex server exited')), \
+             patch.object(m, 'claude_usage', return_value={'windows': [], 'updated': 7}):
+            result = m.quota()
+        self.assertEqual([(p['id'], p['error']) for p in result['providers']], [('codex', 'Codex server exited'), ('claude', None)])
+
+class StatuslineWrapperTests(unittest.TestCase):
+    script = str(Path(__file__).parents[1] / 'Resources/claude_statusline.py')
+    def run_wrapper(self, state, payload, *args):
+        return subprocess.run(['python3', self.script, *args], input=payload, capture_output=True, text=True,
+                              env=dict(os.environ, HERDR_NOTCH_STATE=state))
+    def test_records_limits_and_passes_identical_input_to_wrapped_command(self):
+        payload = json.dumps({'model': {'display_name': 'Opus'}, 'rate_limits': {'five_hour': {'used_percentage': 5, 'resets_at': 9}}})
+        with tempfile.TemporaryDirectory() as d:
+            result = self.run_wrapper(d, payload, '--wrap', 'cat; exit 3')
+            self.assertEqual((result.stdout, result.returncode), (payload, 3))
+            self.assertEqual(json.loads(Path(d, 'claude-usage.json').read_text())['rate_limits']['five_hour']['used_percentage'], 5)
+    def test_without_limits_or_wrapped_command_prints_fallback_and_records_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            result = self.run_wrapper(d, json.dumps({'model': {'display_name': 'Opus'}, 'context_window': {'used_percentage': 41.6}}))
+            self.assertEqual(result.stdout.strip(), '[Opus] context 42%')
+            self.assertFalse(Path(d, 'claude-usage.json').exists())
+    def test_invalid_input_still_runs_status_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(self.run_wrapper(d, 'not json', '--wrap', 'echo ok').stdout, 'ok\n')

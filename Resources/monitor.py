@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only Herdr inventory and Codex account quota bridge. No inference calls."""
+"""Read-only Herdr inventory and Codex / Claude usage bridge. No inference calls."""
 import json, os, sys, shutil, subprocess, threading, queue, time, signal, base64, ntpath
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8,6 +8,14 @@ def binary(name):
     override = os.environ.get(name.upper() + '_BIN')
     choices = [override, shutil.which(name), os.path.expanduser('~/.local/bin/' + name), '/opt/homebrew/bin/' + name, '/usr/local/bin/' + name]
     return next((p for p in choices if p and os.path.isfile(p)), name)
+
+# Herdr agent kinds the notch lists (see `herdr agent start --kind`).
+AGENT_KINDS = ('codex', 'claude')
+STATE = Path(os.environ.get('HERDR_NOTCH_STATE') or Path.home() / 'Library/Application Support/Herdr Notch')
+
+def agent_kind(agent):
+    name = (agent or '').lower()
+    return next((kind for kind in AGENT_KINDS if kind in name), None)
 
 class QueryTimeout(RuntimeError):
     pass
@@ -115,9 +123,10 @@ def inventory(emit=None):
             labels = {w['workspace_id']: w.get('label', '') for w in snapshot.get('workspaces', [])}
             result = []
             for a in rows:
-                if 'codex' not in a.get('agent', '').lower(): continue
+                kind = agent_kind(a.get('agent'))
+                if kind is None: continue
                 pane = a['pane_id']
-                result.append(dict(id=machine['id']+':'+session+':'+pane, machineId=machine['id'], machine=machine['label'], pane=pane, session=session, title=a.get('terminal_title_stripped') or a.get('name') or pane, cwd=a.get('foreground_cwd') or a.get('cwd') or '', status=a.get('agent_status', 'unknown'), workspace=labels.get(a.get('workspace_id'), '')))
+                result.append(dict(id=machine['id']+':'+session+':'+pane, machineId=machine['id'], machine=machine['label'], pane=pane, session=session, title=a.get('terminal_title_stripped') or a.get('name') or pane, cwd=a.get('foreground_cwd') or a.get('cwd') or '', status=a.get('agent_status', 'unknown'), agent=kind, workspace=labels.get(a.get('workspace_id'), '')))
             machine['workspaces'] = sorted(set(labels.values()))
             return machine, session, result, None, snapshot
         except Exception as e:
@@ -191,7 +200,7 @@ def navigation_plans(endpoints):
     first = next((i for i, row in enumerate(rows) if row is not None), 0)
     return {row: i - first for i, row in enumerate(rows) if row is not None}
 
-def quota():
+def codex_quota():
     p = subprocess.Popen([binary('codex'), 'app-server', '--listen', 'stdio://'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     q = queue.Queue()
     def reader():
@@ -213,7 +222,7 @@ def quota():
                 return message['result']
         raise RuntimeError('Quota request timed out')
     try:
-        rpc(1, 'initialize', {'clientInfo': {'name':'herdr_notch', 'title':'Herdr Notch', 'version':'0.2.0'}})
+        rpc(1, 'initialize', {'clientInfo': {'name':'herdr_notch', 'title':'Herdr Notch', 'version':'0.3.0'}})
         send({'method':'initialized','params':{}})
         result = rpc(2, 'account/rateLimits/read')
         buckets = result.get('rateLimitsByLimitId') or {'codex':result.get('rateLimits')}
@@ -224,13 +233,50 @@ def quota():
                 w=bucket.get(kind)
                 if w:
                     minutes=w.get('windowDurationMins') or 0
-                    label = str(minutes//1440)+' 天' if minutes>=1440 else str(minutes//60)+' 小時' if minutes>=60 else str(minutes)+' 分鐘'
-                    windows.append(dict(id=key+kind, label=(bucket.get('limitName') or key)+' · '+label, remaining=max(0,min(100,100-w['usedPercent'])), resetsAt=w.get('resetsAt'), plan=bucket.get('planType')))
+                    label = window_label(minutes)
+                    windows.append(dict(id=key+kind, label=label if key == 'codex' else (bucket.get('limitName') or key)+' · '+label, remaining=max(0,min(100,100-w['usedPercent'])), resetsAt=w.get('resetsAt'), plan=bucket.get('planType')))
         return dict(windows=windows, updated=time.time(), error=None)
     finally:
         p.terminate()
         try: p.wait(timeout=3)
         except subprocess.TimeoutExpired: p.kill(); p.wait()
+
+def window_label(minutes):
+    return str(minutes//1440)+' 天' if minutes>=1440 else str(minutes//60)+' 小時' if minutes>=60 else str(minutes)+' 分鐘'
+
+def claude_usage(now=None):
+    """Latest Claude subscription limits recorded by claude_statusline.py."""
+    now = now or time.time()
+    path = STATE / 'claude-usage.json'
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        raise RuntimeError('尚未取得：請設定 Claude Code statusLine（見 README），回應一次後就會出現') from None
+    except (OSError, ValueError):
+        raise RuntimeError('Claude 額度紀錄無法讀取') from None
+    limits = data.get('rate_limits') or {}
+    names = {'five_hour': '5 小時', 'seven_day': '7 天'}
+    windows = []
+    for key, label in names.items():
+        w = limits.get(key)
+        # Claude Code drops a window once it resets; a stale record must too.
+        if isinstance(w, dict) and isinstance(w.get('used_percentage'), (int, float)) and (w.get('resets_at') or now + 1) > now:
+            windows.append(dict(id='claude-'+key, label=label, remaining=max(0, min(100, 100-w['used_percentage'])), resetsAt=w.get('resets_at'), plan=None))
+    spend = limits.get('spend_limit')
+    if isinstance(spend, dict) and isinstance(spend.get('used_percentage'), (int, float)) and (spend.get('resets_at') or now + 1) > now:
+        period = {'daily': '每日', 'weekly': '每週', 'monthly': '每月'}.get(spend.get('period'), '')
+        windows.append(dict(id='claude-spend', label=('花費上限 ' + period).strip(), remaining=max(0, min(100, 100-spend['used_percentage'])), resetsAt=spend.get('resets_at'), plan=None))
+    return dict(windows=windows, updated=data.get('updated') or now)
+
+def provider(id, label, read):
+    try:
+        result = read()
+        return dict(id=id, label=label, windows=result['windows'], updated=result['updated'], error=None)
+    except Exception as e:
+        return dict(id=id, label=label, windows=[], updated=time.time(), error=query_error(e))
+
+def quota():
+    return dict(providers=[provider('codex', 'Codex', codex_quota), provider('claude', 'Claude', claude_usage)], updated=time.time())
 
 if __name__=='__main__':
     try:
@@ -238,8 +284,7 @@ if __name__=='__main__':
             stream_inventory()
             sys.exit(0)
         elif len(sys.argv)>1 and sys.argv[1]=='quota':
-            try: result=quota()
-            except Exception as e: result=dict(windows=[], error=str(e), updated=time.time())
+            result=quota()
         elif len(sys.argv)>1 and sys.argv[1]=='focus':
             try: result=dict(agent=focus(sys.argv[2],sys.argv[3],sys.argv[4]))
             except Exception as e: result=dict(error=query_error(e))

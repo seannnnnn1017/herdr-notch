@@ -6,6 +6,7 @@ app="$PWD/dist/Herdr Notch.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp .build/release/HerdrNotch "$app/Contents/MacOS/HerdrNotch"
 cp Resources/monitor.py "$app/Contents/Resources/monitor.py"
+cp Resources/claude_statusline.py "$app/Contents/Resources/claude_statusline.py"
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -14,7 +15,7 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>Herdr Notch</string>
 <key>CFBundleExecutable</key><string>HerdrNotch</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.2.0</string>
+<key>CFBundleShortVersionString</key><string>0.3.0</string>
 <key>NSAppleEventsUsageDescription</key><string>在現有 Ghostty Herdr terminal 中切換指定 pane。</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
