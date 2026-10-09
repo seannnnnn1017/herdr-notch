@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Read-only Herdr inventory and Codex account quota bridge. No inference calls."""
+import json, os, sys, shutil, subprocess, threading, queue, time, signal, base64, ntpath
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def binary(name):
+    override = os.environ.get(name.upper() + '_BIN')
+    choices = [override, shutil.which(name), os.path.expanduser('~/.local/bin/' + name), '/opt/homebrew/bin/' + name, '/usr/local/bin/' + name]
+    return next((p for p in choices if p and os.path.isfile(p)), name)
+
+class QueryTimeout(RuntimeError):
+    pass
+
+def call(args, timeout=None):
+    timeout = timeout if timeout is not None else (15 if '--machine' in args else 8)
+    return run_json([binary('herdr')] + args, timeout)
+
+def run_json(command, timeout):
+    # Own a new process group so timeout cleanup touches only this query,
+    # including its SSH child, never the existing client/server or SSH master.
+    p = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        stdout, stderr = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try: os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+        try: p.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            p.stdout.close(); p.stderr.close(); p.wait(timeout=1)
+        raise QueryTimeout('狀態讀取逾時，請稍後重試') from None
+    if p.returncode:
+        # Herdr reports API errors as one JSON object; keep its message.
+        message = None
+        for stream in (stderr, stdout):
+            try: message = json.loads(stream)['error']['message']; break
+            except (ValueError, KeyError, TypeError): pass
+        raise RuntimeError(message or (stderr.strip().splitlines()[0] if stderr.strip() else 'Herdr 未回應'))
+    return json.loads(stdout)
+
+def windows_metadata(profile):
+    if not profile or not profile.get('target'): return None
+    profile_id = profile.get('id', '')
+    if len(profile_id) != 32 or any(c not in '0123456789abcdef' for c in profile_id): return None
+    state_dir = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home()/'.local/state'))
+    path = state_dir/'herdr/client/ssh-metadata'/f'{profile_id}.json'
+    try:
+        if path.is_symlink() or path.stat().st_size > 16384: return None
+        data = json.loads(path.read_text())
+    except (OSError, ValueError): return None
+    if data.get('version') != 1: return None
+    metadata = data.get('metadata', {})
+    if data.get('target') != profile['target'] or data.get('session') != profile.get('session', 'default'): return None
+    executable = metadata.get('executable', '')
+    if metadata.get('os') != 'windows' or not isinstance(executable, str) or not ntpath.isabs(executable) or not ntpath.splitdrive(executable)[0]: return None
+    return metadata
+
+def endpoint_api(prefix, args, profile=None):
+    metadata = windows_metadata(profile)
+    if metadata is None:
+        return call(prefix + args)
+    # Same public API and saved session. Calling the Windows executable
+    # directly avoids the intermittent stdio bridge startup hang.
+    def quote(value): return "'" + value.replace("'", "''") + "'"
+    script = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding; & " + quote(metadata['executable']) + " --session " + quote(profile.get('session', 'default')) + " " + " ".join(quote(a) for a in args) + "; exit $LASTEXITCODE"
+    encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+    command = ['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=5', '--', profile['target'], 'powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ' + encoded]
+    return run_json(command, 15)
+
+def read_snapshot(prefix, profile=None):
+    return endpoint_api(prefix, ['api', 'snapshot'], profile)['result']['snapshot']
+
+def query_error(error):
+    """Keep one endpoint's diagnostics short enough for the notch surface."""
+    message = str(error).strip().splitlines()
+    message = message[0] if message else 'Herdr 未回應'
+    return message if len(message) <= 180 else message[:177] + '…'
+
+def inventory(emit=None):
+    agents, errors, targets, machines = [], [], [], []
+    snapshots = {}
+    profiles_by_id = {}
+    local = dict(id='local', label='Local', state='online', agentCount=0)
+    machines.append(local)
+    try:
+        sessions = call(['session', 'list', '--json'])['sessions']
+        for s in sessions:
+            if s.get('running'):
+                targets.append((local, s['name'], ['--session', s['name']]))
+    except Exception as e:
+        local['state'] = 'offline'
+        errors.append('Local: ' + query_error(e))
+    try:
+        for profile in call(['machine', 'list', '--json']):
+            if not profile.get('enabled'): continue
+            profiles_by_id[profile['id']] = profile
+            machine = dict(id=profile['id'], label=profile['label'], state='online', agentCount=0)
+            machines.append(machine)
+            targets.append((machine, profile.get('session', 'default'), ['--machine', profile['id']]))
+    except Exception as e:
+        errors.append('遠端機器清單: ' + query_error(e))
+
+    if emit is not None:
+        active_machines = {machine['id'] for machine, _, _ in targets}
+        emit(dict(type='targets',
+            machines=[dict(machine, state='checking' if machine['id'] in active_machines else machine['state']) for machine in machines],
+            targets=[dict(machineId=machine['id'], session=session) for machine, session, _ in targets],
+            errors=list(errors), updated=time.time()))
+
+    def read_target(target):
+        machine, session, prefix = target
+        try:
+            snapshot = read_snapshot(prefix, profiles_by_id.get(machine['id']))
+            rows = snapshot['agents']
+            labels = {w['workspace_id']: w.get('label', '') for w in snapshot.get('workspaces', [])}
+            result = []
+            for a in rows:
+                if 'codex' not in a.get('agent', '').lower(): continue
+                pane = a['pane_id']
+                result.append(dict(id=machine['id']+':'+session+':'+pane, machineId=machine['id'], machine=machine['label'], pane=pane, session=session, title=a.get('terminal_title_stripped') or a.get('name') or pane, cwd=a.get('foreground_cwd') or a.get('cwd') or '', status=a.get('agent_status', 'unknown'), workspace=labels.get(a.get('workspace_id'), '')))
+            machine['workspaces'] = sorted(set(labels.values()))
+            return machine, session, result, None, snapshot
+        except Exception as e:
+            return machine, session, [], machine['label'] + '/' + session + ': ' + query_error(e), None
+
+    rows_by_target, errors_by_target = {}, {}
+    # Publish each completed endpoint before waiting for a slow/offline PC.
+    # Keep final inventory order stable for callers of the original API.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(read_target, target) for target in targets]
+        for future in as_completed(futures):
+            machine, session, rows, error, snapshot = future.result()
+            key = (machine['id'], session)
+            rows_by_target[key] = rows
+            if snapshot is not None:
+                snapshots[key] = snapshot
+            machine['agentCount'] += len(rows)
+            if error:
+                machine['state'] = 'offline'
+                errors_by_target[key] = error
+            if emit is not None:
+                emit(dict(type='target', machineId=machine['id'], session=session,
+                    agents=rows, error=error, state='offline' if error else 'online',
+                    workspaces=machine.get('workspaces', []), updated=time.time()))
+    for machine, session, _ in targets:
+        key = (machine['id'], session)
+        agents.extend(rows_by_target.get(key, []))
+        if key in errors_by_target:
+            errors.append(errors_by_target[key])
+    navigation = {}
+    endpoints = [('local', 'default', snapshots.get(('local', 'default')))] + [
+        (machine['id'], session, snapshots.get((machine['id'], session)))
+        for machine, session, _ in targets if machine['id'] != 'local'
+    ]
+    navigation = navigation_plans(endpoints)
+    result = dict(agents=agents, machines=machines, errors=errors, navigation=navigation, updated=time.time())
+    if emit is not None:
+        emit(dict(type='done', errors=errors, machines=machines, agents=agents, updated=result['updated']))
+    return result
+
+def stream_inventory():
+    def emit(event):
+        print(json.dumps(event, ensure_ascii=False), flush=True)
+    inventory(emit=emit)
+
+def focus(machine_id, session, pane):
+    """Focus one agent through Herdr's own API. Since Herdr 0.9.1 this also
+    moves attached clients already viewing that server; no keystrokes."""
+    if machine_id == 'local':
+        if session != 'default':
+            raise RuntimeError('Herdr 視窗只顯示 default 本機 session')
+        return call(['agent', 'focus', pane])['result']['agent']
+    profile = next((p for p in call(['machine', 'list', '--json']) if p.get('enabled') and p['id'] == machine_id), None)
+    if not profile or profile.get('session', 'default') != session:
+        raise RuntimeError('遠端連線設定已變更，請重新整理')
+    return endpoint_api(['--machine', machine_id], ['agent', 'focus', pane], profile)['result']['agent']
+
+def navigation_plans(endpoints):
+    rows = []
+    for endpoint_id, session, snapshot in endpoints:
+        # Rows before an unavailable endpoint are still unambiguous. Rows
+        # after it depend on its unknown cached topology and must be omitted.
+        if snapshot is None: break
+        if len(endpoints) > 1:
+            rows.append(None)
+        for workspace in snapshot['workspaces']:
+            rows.append(None)
+            for tab in snapshot['tabs']:
+                if tab['workspace_id'] == workspace['workspace_id']:
+                    rows.extend(endpoint_id + ':' + session + ':' + p['pane_id'] for p in snapshot['panes'] if p['tab_id'] == tab['tab_id'])
+    first = next((i for i, row in enumerate(rows) if row is not None), 0)
+    return {row: i - first for i, row in enumerate(rows) if row is not None}
+
+def quota():
+    p = subprocess.Popen([binary('codex'), 'app-server', '--listen', 'stdio://'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    q = queue.Queue()
+    def reader():
+        for line in p.stdout:
+            try: q.put(json.loads(line))
+            except ValueError: pass
+        q.put(None)
+    threading.Thread(target=reader, daemon=True).start()
+    def send(message):
+        p.stdin.write(json.dumps(message)+'\n'); p.stdin.flush()
+    def rpc(id, method, params=None):
+        send(dict(id=id, method=method, params=params or {}))
+        deadline = time.monotonic()+15
+        while time.monotonic()<deadline:
+            message = q.get(timeout=max(.1, deadline-time.monotonic()))
+            if message is None: raise RuntimeError('Codex server exited')
+            if message.get('id') == id:
+                if 'error' in message: raise RuntimeError(message['error'].get('message', 'Codex error'))
+                return message['result']
+        raise RuntimeError('Quota request timed out')
+    try:
+        rpc(1, 'initialize', {'clientInfo': {'name':'herdr_notch', 'title':'Herdr Notch', 'version':'0.2.0'}})
+        send({'method':'initialized','params':{}})
+        result = rpc(2, 'account/rateLimits/read')
+        buckets = result.get('rateLimitsByLimitId') or {'codex':result.get('rateLimits')}
+        windows=[]
+        for key,bucket in buckets.items():
+            if not bucket: continue
+            for kind in ['primary','secondary']:
+                w=bucket.get(kind)
+                if w:
+                    minutes=w.get('windowDurationMins') or 0
+                    label = str(minutes//1440)+' 天' if minutes>=1440 else str(minutes//60)+' 小時' if minutes>=60 else str(minutes)+' 分鐘'
+                    windows.append(dict(id=key+kind, label=(bucket.get('limitName') or key)+' · '+label, remaining=max(0,min(100,100-w['usedPercent'])), resetsAt=w.get('resetsAt'), plan=bucket.get('planType')))
+        return dict(windows=windows, updated=time.time(), error=None)
+    finally:
+        p.terminate()
+        try: p.wait(timeout=3)
+        except subprocess.TimeoutExpired: p.kill(); p.wait()
+
+if __name__=='__main__':
+    try:
+        if len(sys.argv)>1 and sys.argv[1]=='stream':
+            stream_inventory()
+            sys.exit(0)
+        elif len(sys.argv)>1 and sys.argv[1]=='quota':
+            try: result=quota()
+            except Exception as e: result=dict(windows=[], error=str(e), updated=time.time())
+        elif len(sys.argv)>1 and sys.argv[1]=='focus':
+            try: result=dict(agent=focus(sys.argv[2],sys.argv[3],sys.argv[4]))
+            except Exception as e: result=dict(error=query_error(e))
+        else: result=inventory()
+        print(json.dumps(result, ensure_ascii=False))
+    except Exception as e:
+        if len(sys.argv)>1 and sys.argv[1]=='stream':
+            print(json.dumps(dict(type='done', errors=[query_error(e)], updated=time.time()), ensure_ascii=False), flush=True)
+        else:
+            print(json.dumps(dict(agents=[],errors=[str(e)], updated=time.time())))
