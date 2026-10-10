@@ -195,7 +195,13 @@ func appendNotchLog(_ message: String) {
     /// session, with their paths handed to it, and the client jumps there.
     func launch(kind: String, urls: [URL]) {
         let name = kind == "claude" ? "Claude" : "Codex"
-        guard focusingID == nil, !urls.isEmpty else { launchingKind = nil; dropActive = false; return }
+        guard focusingID == nil, !urls.isEmpty else {
+            let reason = urls.isEmpty ? "沒有讀到檔案路徑，請再拖一次" : "上一個切換還在進行，請稍後再試"
+            appendNotchLog("FAILED: launch \(kind): " + reason)
+            launchingKind = nil; dropActive = false
+            showToast(reason)
+            return
+        }
         guard let terminal = NSRunningApplication.runningApplications(withBundleIdentifier: "com.mitchellh.ghostty").first else {
             launchingKind = nil; dropActive = false
             showToast("找不到已開啟的 Ghostty／Herdr 視窗")
@@ -466,17 +472,27 @@ struct DropTarget: View {
                 style: StrokeStyle(lineWidth: 1.5, dash: targeted ? [] : [5, 4])))
             .scaleEffect(targeted ? 1.02 : 1).animation(.easeOut(duration: 0.12), value: targeted)
             .opacity(model.launchingKind == nil || busy ? 1 : 0.4)
+            .onChange(of: targeted) { inside in appendNotchLog("drop target \(kind): \(inside ? "entered" : "left")") }
             .onDrop(of: [UTType.fileURL], isTargeted: $targeted) { providers in
-                guard model.launchingKind == nil else { return false }
+                guard model.launchingKind == nil else {
+                    appendNotchLog("drop \(kind): ignored, \(model.launchingKind ?? "") is still opening")
+                    return false
+                }
+                // The drag pasteboard already holds the file URLs, for any
+                // file type or folder; item providers can fail to load them.
+                let dragged = NSPasteboard(name: .drag).readObjects(forClasses: [NSURL.self],
+                    options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+                appendNotchLog("drop \(kind): \(dragged.count) file URL(s) on the drag pasteboard, \(providers.count) provider(s)")
                 // Claim the drop now: the drag's mouse-up would otherwise
-                // dismiss the zone before the file URLs finish loading.
+                // dismiss the zone before a provider fallback finishes.
                 model.launchingKind = kind
+                guard dragged.isEmpty else { model.launch(kind: kind, urls: dragged); return true }
                 var urls: [URL] = []
                 let group = DispatchGroup()
                 for provider in providers {
                     group.enter()
                     _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                        DispatchQueue.main.async { if let url { urls.append(url) }; group.leave() }
+                        DispatchQueue.main.async { if let url, url.isFileURL { urls.append(url) }; group.leave() }
                     }
                 }
                 group.notify(queue: .main) { model.launch(kind: kind, urls: urls) }
@@ -593,6 +609,7 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
             guard !model.dropActive, wantsVisible, !navigationSuspended, model.focusingID == nil,
                   board.changeCount != dragBaseline,
                   board.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) else { return }
+            appendNotchLog("drag: file drag detected")
             withAnimation(.easeInOut(duration: 0.2)) { model.dropActive = true }
         case .leftMouseUp:
             dragBaseline = board.changeCount
