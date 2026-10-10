@@ -50,15 +50,16 @@ MainActor.assumeIsolated {
     let hosting = NotchHostingView(rootView: Dashboard(model: model))
     hosting.sizingOptions = []
     hosting.registerForDraggedTypes([.fileURL])
-    hosting.dropZoneActive = { model.dropActive && model.launchingKind == nil }
+    hosting.dropTarget = { x, fromTop, width in model.dropTarget(x: x, fromTop: fromTop, width: width) }
     hosting.dropHover = { model.dropHover = $0 }
-    var performed: [(String, [String])] = []
-    hosting.dropPerform = { kind, urls in performed.append((kind, urls.map(\.path))) }
+    var keyRequests: [Bool] = []
+    model.onComposeChange = { keyRequests.append($0) }
+    hosting.dropPerform = { kind, urls in model.stage(target: kind, urls: urls) }
     panel.contentView = hosting
     hosting.layoutSubtreeIfNeeded()
     let board = NSPasteboard(name: NSPasteboard.Name("herdr-notch-check-drop"))
-    board.clearContents()
-    board.writeObjects([URL(fileURLWithPath: "/tmp/My Folder") as NSURL, URL(fileURLWithPath: "/tmp/data.zip") as NSURL])
+    func load(_ paths: [String]) { board.clearContents(); board.writeObjects(paths.map { URL(fileURLWithPath: $0) as NSURL }) }
+    load(["/tmp/My Folder", "/tmp/data.zip"])
     // Window points have a bottom-left origin; the zone is the top dropZoneHeight.
     @MainActor func drag(_ x: CGFloat, fromTop: CGFloat) -> FakeDrag { FakeDrag(NSPoint(x: x, y: expandedHeight - fromTop), board, panel) }
     @MainActor func hover(_ x: CGFloat, _ fromTop: CGFloat) -> (String?, Bool) {
@@ -72,16 +73,37 @@ MainActor.assumeIsolated {
     check(hover(360, dropZoneHeight + 40) == (nil, false), "Below the zone the drag passes through")
     hosting.draggingExited(nil)
     check(model.dropHover == nil, "Leaving clears the highlight")
+
+    // A drop stages files for that agent instead of launching anything.
     check(hosting.performDragOperation(drag(360, fromTop: 75)), "A drop on the right is accepted")
-    check(performed.count == 1 && performed[0].0 == "codex" && performed[0].1 == ["/tmp/My Folder", "/tmp/data.zip"],
-          "Folders and any file type arrive as paths, for Codex")
-    check(hosting.performDragOperation(drag(120, fromTop: 75)) && performed.last?.0 == "claude", "A drop on the left opens Claude")
-    model.launchingKind = "codex"
-    check(hover(120, 75) == (nil, false) && !hosting.performDragOperation(drag(120, fromTop: 75)), "No second drop while one is opening")
-    model.launchingKind = nil; model.dropActive = false
+    check(model.composing && model.draftKind == "codex" && model.draftFiles.map(\.path) == ["/tmp/My Folder", "/tmp/data.zip"],
+          "Folders and any file type are staged as paths, for Codex")
+    check(keyRequests == [true] && model.panelSize.height == composeHeight && !model.showsDropZone, "Composing asks for keyboard focus and shows the tray")
+    check(model.launchingKind == nil && model.focusingID == nil, "Nothing is launched by a drop")
+
+    // While composing, the whole tray takes more files; the agent choice is kept.
+    load(["/tmp/data.zip", "/tmp/photo.png"])
+    model.dropActive = true
+    check(hover(120, 75) == ("add", true) && hover(360, 150) == ("add", true), "Either half of the tray adds files")
+    check(hover(120, composeHeight + 30) == (nil, false), "Below the tray the drag passes through")
+    check(hosting.performDragOperation(drag(120, fromTop: 75)), "A drop on the tray is accepted")
+    check(model.draftFiles.map(\.lastPathComponent) == ["My Folder", "data.zip", "photo.png"] && model.draftKind == "codex",
+          "Added files are appended once, without changing the agent")
+    model.draftKind = "claude"; model.draftText = "這是什麼？"
+    model.removeDraftFile(URL(fileURLWithPath: "/tmp/data.zip"))
+    check(model.draftFiles.count == 2 && model.composing && model.draftText == "這是什麼？", "Removing one file keeps the draft")
+    model.removeDraftFile(URL(fileURLWithPath: "/tmp/My Folder")); model.removeDraftFile(URL(fileURLWithPath: "/tmp/photo.png"))
+    check(!model.composing && model.draftText.isEmpty && keyRequests == [true, false], "Removing the last file ends the draft and releases focus")
+    check(model.panelSize.height == 34, "The notch returns to its compact strip")
+
+    model.dropActive = false
     check(hover(360, 75) == (nil, false), "Without a file drag the notch is not a drop target")
+    load(["/tmp/a.txt"]); model.dropActive = true
+    _ = hosting.performDragOperation(drag(120, fromTop: 75))
+    model.cancelDraft()
+    check(!model.composing && model.draftFiles.isEmpty && keyRequests.last == false, "Cancel discards the draft")
     board.releaseGlobally()
-    print("PASS: \(checks) drop target checks; nothing launched")
+    print("PASS: \(checks) drop and staging checks; nothing launched")
     exit(0)
 }
 '''

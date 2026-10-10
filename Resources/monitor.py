@@ -214,18 +214,36 @@ def launch_tab(kind, paths):
     workspace = call(['workspace', 'get', workspace_id])['result']['workspace']
     return dict(pane=created['root_pane']['pane_id'], tab=created['tab']['tab_id'], workspace=workspace.get('label', ''), cwd=cwd, label=label)
 
-def launch_agent(kind, pane, paths, start_timeout=8000):
-    """Start the agent in the new pane, then hand it the dropped paths."""
+def initial_prompt(question, paths):
+    """One line: Herdr refuses agent arguments containing newlines. Paths are
+    quoted so names with spaces stay whole; the agent opens them itself."""
+    line = ' '.join(question.split())
+    files = ' '.join(json.dumps(path, ensure_ascii=False) for path in paths)
+    return line + ('  （檔案：' + files + '）' if files else '')
+
+def launch_agent(kind, pane, paths, prompt=None, start_timeout=8000):
+    """Start the agent in the new pane and hand it the dropped paths: with a
+    question, as its initial prompt; without one, pasted into its input."""
     if kind not in AGENT_KINDS: raise RuntimeError('不支援的 agent：' + kind)
     paths = [os.path.abspath(p) for p in paths]
     name = 'notch-%s-%d' % (kind, int(time.time()) % 1000000)
+    question = ' '.join((prompt or '').split())
+    start = ['agent', 'start', name, '--kind', kind, '--pane', pane, '--timeout', str(start_timeout)]
+    if question: start += ['--', initial_prompt(question, paths)]
     error = None
-    try: call(['agent', 'start', name, '--kind', kind, '--pane', pane, '--timeout', str(start_timeout)], timeout=start_timeout / 1000 + 10)
+    try: call(start, timeout=start_timeout / 1000 + 10)
     except Exception as e: error = query_error(e)
     # Herdr moves attached clients for agent focus; the tab may have been
     # created while the client was still on another machine.
     try: call(['agent', 'focus', pane])
     except Exception: pass
+    if question:
+        # A working agent is not "ready for input", so readiness can time
+        # out although it started and is answering.
+        if error:
+            try: call(['agent', 'get', pane]); error = None
+            except Exception: pass
+        return dict(submitted=error is None, pasted=False, copied=False, startError=error)
     pasted = False
     try:
         call(['pane', 'send-text', pane, pasted_paths(paths)])
@@ -246,7 +264,7 @@ def launch_agent(kind, pane, paths, start_timeout=8000):
             subprocess.run(['pbcopy'], input=plain, text=True, timeout=3, check=True)
             copied = True
         except (OSError, subprocess.SubprocessError): pass
-    return dict(pasted=pasted, copied=copied, startError=error)
+    return dict(submitted=False, pasted=pasted, copied=copied, startError=error)
 
 def focus_tab(tab):
     return call(['tab', 'focus', tab])['result']
@@ -355,7 +373,10 @@ if __name__=='__main__':
         elif len(sys.argv)>2 and sys.argv[1] in ('launch-tab', 'launch-agent', 'focus-tab'):
             try:
                 if sys.argv[1]=='launch-tab': result=launch_tab(sys.argv[2], sys.argv[3:])
-                elif sys.argv[1]=='launch-agent': result=launch_agent(sys.argv[2], sys.argv[3], sys.argv[4:])
+                elif sys.argv[1]=='launch-agent':
+                    rest = sys.argv[4:]
+                    prompt = rest[1] if len(rest) > 1 and rest[0] == '--prompt' else None
+                    result=launch_agent(sys.argv[2], sys.argv[3], rest[2:] if prompt is not None else rest, prompt=prompt)
                 else: result=dict(tab=focus_tab(sys.argv[2]))
             except Exception as e: result=dict(error=query_error(e))
         elif len(sys.argv)>1 and sys.argv[1]=='focus':

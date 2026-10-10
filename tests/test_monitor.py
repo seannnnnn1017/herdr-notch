@@ -317,3 +317,30 @@ class LaunchTests(unittest.TestCase):
             self.assertEqual(calls[0][calls[0].index('--label') + 1], 'My Project')
             self.assertEqual(os.path.realpath(m.launch_tab('claude', [archive, folder])['cwd']), os.path.realpath(d))
             self.assertEqual(m.pasted_paths([archive, folder]), '\x1b[200~' + archive + ' ' + folder.replace(' ', '\\ ') + ' \x1b[201~')
+    def test_question_and_paths_become_one_line_initial_prompt(self):
+        self.assertEqual(m.initial_prompt('這張圖\n  在講什麼？', ['/a/My File.png', '/tmp/資料夾']),
+                         '這張圖 在講什麼？  （檔案："/a/My File.png" "/tmp/資料夾"）')
+        self.assertNotIn('\n', m.initial_prompt('a\r\nb', ['/x']))
+    def test_question_is_sent_as_the_agents_initial_prompt_without_pasting(self):
+        calls = []
+        def call(args, timeout=None):
+            calls.append(args); return {'result': {}}
+        with patch.object(m, 'call', side_effect=call), patch.object(m.subprocess, 'run') as run:
+            result = m.launch_agent('claude', 'w1:p3', ['/repo/a b.md'], prompt=' 幫我看\n這個 ')
+        self.assertEqual(result, {'submitted': True, 'pasted': False, 'copied': False, 'startError': None})
+        self.assertEqual(calls[0][calls[0].index('--'):], ['--', '幫我看 這個  （檔案："/repo/a b.md"）'])
+        self.assertEqual([c[:2] for c in calls], [['agent', 'start'], ['agent', 'focus']])
+        run.assert_not_called()
+    def test_readiness_timeout_of_a_working_agent_is_not_a_failure(self):
+        def call(args, timeout=None):
+            if args[:2] == ['agent', 'start']: raise RuntimeError('timed out waiting for agent startup')
+            return {'result': {}}
+        with patch.object(m, 'call', side_effect=call):
+            self.assertTrue(m.launch_agent('codex', 'w1:p3', ['/x'], prompt='hi')['submitted'])
+    def test_agent_that_never_started_reports_the_error(self):
+        def call(args, timeout=None):
+            if args[:2] in (['agent', 'start'], ['agent', 'get']): raise RuntimeError('agent target w1:p3 not found')
+            return {'result': {}}
+        with patch.object(m, 'call', side_effect=call):
+            result = m.launch_agent('codex', 'w1:p3', ['/x'], prompt='hi')
+        self.assertEqual((result['submitted'], result['startError']), (False, 'agent target w1:p3 not found'))

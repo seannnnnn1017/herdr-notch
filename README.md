@@ -14,10 +14,13 @@
   <img src="docs/screenshots/compact.png" width="720" alt="收合狀態的瀏海列">
 </p>
 
-拖曳檔案時，瀏海會半展開成放置區，放開就開一個新的 Claude 或 Codex session：
+拖曳檔案時，瀏海會半展開成放置區；放開後檔案先暫存在瀏海，打好問題再一起送給新的 Claude 或 Codex session：
 
 <p align="center">
   <img src="docs/screenshots/drop.png" width="720" alt="拖曳檔案時的放置區：新 Claude session 與新 Codex session">
+</p>
+<p align="center">
+  <img src="docs/screenshots/compose.png" width="720" alt="暫存匣：已放入的檔案、Claude／Codex 切換、問題輸入框與送出鈕">
 </p>
 
 > 截圖以示範資料繪製自 app 本身的 SwiftUI 介面。
@@ -28,7 +31,7 @@
 - **狀態直接來自 Herdr**：工作中、需要回覆（approval／提問）、已完成、待命、未知。出現新的「需要回覆」會播放提示音。
 - **排序**：先依狀態（需要回覆 → 工作中 → 已完成 → 待命），同狀態再依最後使用時間，最近的在前。Herdr 沒有提供時間戳，所以由瀏海自行記錄：agent 狀態改變、你在 Herdr 切到該 pane、或在瀏海點擊它，都算一次使用；紀錄會保留到下次啟動。
 - **機器篩選**：點機器標籤（例如 `Local · 3`）只顯示那台機器的 sessions，再點一次恢復全部。
-- **拖檔案開新 session**：從 Finder 或任何 app 拖檔案時，瀏海半展開成「Claude／Codex」兩個放置區。放開後會在本機 Herdr 開新分頁、啟動該 agent、把檔案路徑填進輸入框（不送出），並跳到那個 pane，直接打問題即可（見[拖曳檔案開新 session](#拖曳檔案開新-session)）。
+- **拖檔案提問**：從 Finder 或任何 app 拖檔案時，瀏海半展開成「Claude／Codex」兩個放置區。放開後檔案暫存在瀏海，可以繼續拖入更多檔案、切換 agent、輸入問題；送出後在本機 Herdr 開新分頁啟動該 agent、帶著問題與檔案直接開始回答，並跳到那個 pane（見[拖曳檔案開新 session](#拖曳檔案開新-session)）。
 - **一鍵跳轉**：點任一列，Ghostty 裡的 Herdr 就會切到那個 agent 的 pane，即使它在另一台機器上（見[跳轉原理](#跳轉原理)）。
 - **Codex 額度**：每 60 秒透過 `codex app-server` 讀取帳號剩餘額度與重置時間，用短暫的唯讀 process，不建立對話、不呼叫模型。
 - **Claude 額度**：顯示 Claude 訂閱的 5 小時與 7 天用量上限（以及 gateway 的花費上限），資料來自 Claude Code 官方 statusLine 提供的 `rate_limits`，不讀取登入憑證、不呼叫任何 API（見[啟用 Claude 額度](#啟用-claude-額度)）。
@@ -120,12 +123,17 @@ flowchart TD
 
 ## 拖曳檔案開新 session
 
-1. 開始拖曳檔案，瀏海會半展開。任何檔案類型、資料夾、多選都可以：瀏海一律只交出路徑，圖片由 agent 自己轉成附件，其他類型就是路徑文字。
-2. 放到「新 Claude session」或「新 Codex session」上。
-3. 瀏海在本機 Herdr 的 `default` session 開一個以檔名命名的新分頁，工作目錄是檔案所在的 git repo 根目錄（不在 repo 裡就用檔案所在資料夾），並啟動 agent。
-4. Ghostty 裡的 Herdr 跳到新分頁；如果 Herdr 當時在看別台機器，會先用[跳轉原理](#跳轉原理)的方式切回 Local。
+1. 開始拖曳檔案，瀏海會半展開。任何檔案類型、資料夾、多選都可以：瀏海一律只交出路徑，由 agent 自己開啟。
+2. 放到「新 Claude session」或「新 Codex session」上，檔案會暫存在瀏海的暫存匣。
+3. 在暫存匣裡可以：繼續拖檔案進來追加、按 × 移除、切換 Claude／Codex、輸入問題。Esc 或右上角的 × 取消。
+4. 按 Enter 或送出鈕。瀏海在本機 Herdr 的 `default` session 開一個以檔名命名的新分頁，工作目錄是第一個檔案所在的 git repo 根目錄（不在 repo 裡就用它所在的資料夾），並啟動 agent。
+5. Ghostty 裡的 Herdr 跳到新分頁；如果 Herdr 當時在看別台機器，會先用[跳轉原理](#跳轉原理)的方式切回 Local。
 
-檔案路徑以「bracketed paste」送進 agent，和你把檔案拖進終端機時終端機做的事一樣，不會送出訊息。Claude Code 與 Codex 啟動時可能先跳出提示（信任資料夾、更新通知等）；這類提示會忽略貼上的內容，所以路徑不會誤答任何提示。瀏海會確認檔名確實出現在畫面上，沒有的話改把路徑放進剪貼簿，並提示你處理完提示後按 ⌘V。
+**有輸入問題時**，問題和檔案路徑會合成一行，當成 agent 的啟動參數（等同 `claude "…"`／`codex "…"`），agent 一啟動就開始回答，不受啟動時的提示（信任資料夾、更新通知）影響。Herdr 不接受含換行的啟動參數，所以問題裡的換行會變成空格。
+
+**問題留空時**，只開啟 agent 並把檔案路徑填進輸入框、不送出。路徑以「bracketed paste」送入，和你把檔案拖進終端機時一樣；啟動提示會忽略貼上的內容，所以不會誤答。瀏海會確認檔名確實出現在畫面上，沒有的話改把路徑放進剪貼簿，並提示你處理完提示後按 ⌘V。
+
+輸入問題時，瀏海面板會暫時取得鍵盤焦點（不會把 app 切到前景）；送出或取消後歸還。開啟失敗時，檔案與問題會留在暫存匣讓你重試。
 
 ## 設定
 

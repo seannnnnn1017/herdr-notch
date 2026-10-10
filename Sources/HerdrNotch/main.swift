@@ -7,6 +7,8 @@ import QuartzCore
 let expandedHeight: CGFloat = 600
 /// Half-expanded heights: drop targets while a file is dragged, and a one-line notice.
 let dropZoneHeight: CGFloat = 152
+/// Staged files with a question field, agent switch and send button.
+let composeHeight: CGFloat = 150
 let toastHeight: CGFloat = 70
 
 func bridge(_ args: [String]) async -> Data? {
@@ -74,8 +76,16 @@ func appendNotchLog(_ message: String) {
     @Published var dropHover: String?
     @Published var toast: String?
     private var toastTask: Task<Void, Never>?
-    var showsDropZone: Bool { dropActive || launchingKind != nil }
+    /// Dropped files wait here with a question until sent.
+    @Published var draftFiles: [URL] = []
+    @Published var draftKind = "claude"
+    @Published var draftText = ""
+    var composing: Bool { !draftFiles.isEmpty && launchingKind == nil }
+    /// The panel must be key to type while composing, and only then.
+    var onComposeChange: ((Bool) -> Void)?
+    var showsDropZone: Bool { (dropActive && draftFiles.isEmpty) || launchingKind != nil }
     var panelSize: CGSize {
+        if composing { return CGSize(width: 480, height: composeHeight) }
         if showsDropZone { return CGSize(width: 480, height: dropZoneHeight) }
         if toast != nil { return CGSize(width: 480, height: toastHeight) }
         return expanded ? CGSize(width: 480, height: expandedHeight) : CGSize(width: compactWidth, height: 34)
@@ -183,6 +193,41 @@ func appendNotchLog(_ message: String) {
     private func apiFocus(_ agent: Agent) async throws {
         _ = try await bridgeReply(["focus", agent.machineId, agent.session, agent.pane], context: "\(agent.machine) · \(agent.pane)")
     }
+    /// The drop target under a point of the notch canvas, measured from its
+    /// top-left: "add" on the compose tray, else the left or right agent.
+    func dropTarget(x: CGFloat, fromTop: CGFloat, width: CGFloat) -> String? {
+        guard x >= 0, x <= width, fromTop >= 0 else { return nil }
+        if composing { return fromTop <= composeHeight ? "add" : nil }
+        guard dropActive, launchingKind == nil, focusingID == nil, fromTop <= dropZoneHeight else { return nil }
+        return x < width / 2 ? "claude" : "codex"
+    }
+    /// Stage dropped files: a drop on an agent target starts a draft for that
+    /// agent, a drop on the tray adds to it.
+    func stage(target: String, urls: [URL]) {
+        let fresh = urls.filter { url in !draftFiles.contains { $0.path == url.path } }
+        guard !urls.isEmpty else { showToast("沒有讀到檔案路徑，請再拖一次"); return }
+        let starting = draftFiles.isEmpty
+        if starting, target != "add" { draftKind = target }
+        withAnimation(.easeInOut(duration: 0.2)) { draftFiles += fresh; dropActive = false }
+        dropHover = nil
+        if starting { onComposeChange?(true) }
+    }
+    func removeDraftFile(_ url: URL) {
+        withAnimation(.easeInOut(duration: 0.15)) { draftFiles.removeAll { $0.path == url.path } }
+        if draftFiles.isEmpty { cancelDraft() }
+    }
+    func cancelDraft() {
+        withAnimation(.easeInOut(duration: 0.2)) { draftFiles = []; draftText = "" }
+        dropHover = nil
+        onComposeChange?(false)
+    }
+    func sendDraft() {
+        guard composing else { return }
+        let files = draftFiles, kind = draftKind, text = draftText.trimmingCharacters(in: .whitespacesAndNewlines)
+        draftFiles = []; draftText = ""
+        onComposeChange?(false)
+        launch(kind: kind, urls: files, prompt: text)
+    }
     func showToast(_ message: String) {
         toastTask?.cancel()
         withAnimation(.easeInOut(duration: 0.2)) { toast = message }
@@ -194,7 +239,7 @@ func appendNotchLog(_ message: String) {
     }
     /// Dropped files open a new agent in a fresh tab of the local Herdr
     /// session, with their paths handed to it, and the client jumps there.
-    func launch(kind: String, urls: [URL]) {
+    func launch(kind: String, urls: [URL], prompt: String = "") {
         let name = kind == "claude" ? "Claude" : "Codex"
         guard focusingID == nil, !urls.isEmpty else {
             let reason = urls.isEmpty ? "沒有讀到檔案路徑，請再拖一次" : "上一個切換還在進行，請稍後再試"
@@ -213,9 +258,14 @@ func appendNotchLog(_ message: String) {
         Task {
             var handedOff = false
             var succeeded = false
+            var restoreDraft: ([URL], String, String)?
             defer {
                 focusingID = nil; launchingKind = nil; dropActive = false; dropHover = nil
                 if handedOff { onNavigationEnd?(succeeded) }
+                if let (files, kind, text) = restoreDraft {
+                    draftFiles = files; draftKind = kind; draftText = text
+                    onComposeChange?(true)
+                }
             }
             let paths = urls.map(\.path)
             do {
@@ -229,7 +279,7 @@ func appendNotchLog(_ message: String) {
                 agent.agent = kind
                 // The agent starts while Ghostty is brought over; a startup
                 // dialog must not hold the jump for the readiness timeout.
-                let started = Task { await bridge(["launch-agent", kind, pane] + paths) }
+                let started = Task { await bridge(["launch-agent", kind, pane] + (prompt.isEmpty ? [] : ["--prompt", prompt]) + paths) }
                 try await GhosttyNavigation.switchPane(
                     agent: agent, machines: machines,
                     knownTitles: agents.map(\.title) + machines.flatMap { $0.workspaces ?? [] } + [agent.workspace ?? ""],
@@ -241,7 +291,9 @@ func appendNotchLog(_ message: String) {
                 succeeded = true
                 let outcome = await started.value.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
                 let message: String
-                if outcome["pasted"] as? Bool == true { message = "已開啟 \(name)，檔案路徑已填入" }
+                if outcome["submitted"] as? Bool == true { message = "已送出給 \(name)" }
+                else if !prompt.isEmpty { message = "已開啟分頁，但 \(name) 未啟動：\(outcome["startError"] as? String ?? "未知錯誤")" }
+                else if outcome["pasted"] as? Bool == true { message = "已開啟 \(name)，檔案路徑已填入" }
                 else if outcome["copied"] as? Bool == true { message = "已開啟 \(name)；路徑已複製，處理完提示後按 ⌘V 貼上" }
                 else { message = "已開啟 \(name)，但檔案路徑未能填入" }
                 appendNotchLog("OK: " + message)
@@ -249,6 +301,8 @@ func appendNotchLog(_ message: String) {
             } catch {
                 appendNotchLog("FAILED: " + error.localizedDescription)
                 showToast(error.localizedDescription)
+                // Nothing was sent: keep what was typed for another try.
+                if !prompt.isEmpty, !succeeded { restoreDraft = (urls, kind, prompt) }
             }
         }
     }
@@ -328,7 +382,9 @@ struct Dashboard: View {
                 .contentShape(Rectangle())
                 .help("\(model.working) 個工作中，\(model.blocked) 個待回覆，\(model.agents.count) 個 sessions；移入展開")
             }.buttonStyle(.plain).accessibilityLabel("展開 Herdr 工作台")
-            if model.showsDropZone {
+            if model.composing {
+                ComposeTray(model: model).transition(.opacity)
+            } else if model.showsDropZone {
                 DropZone(model: model).transition(.opacity)
             } else if let toast = model.toast {
                 Text(toast).font(.system(size: 11, weight: .medium)).foregroundColor(.mint)
@@ -457,6 +513,58 @@ struct DropZone: View {
         }.padding(.horizontal, 20).padding(.top, 4).padding(.bottom, 14)
     }
 }
+/// Staged files, a question, the agent choice and a send button.
+struct ComposeTray: View {
+    @ObservedObject var model: Model
+    @FocusState private var typing: Bool
+    var body: some View {
+        let adding = model.dropHover == "add"
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(model.draftFiles, id: \.path) { url in
+                            HStack(spacing: 4) {
+                                Image(systemName: url.hasDirectoryPath ? "folder.fill" : "doc.fill").font(.system(size: 9))
+                                Text(url.lastPathComponent).font(.system(size: 11)).lineLimit(1).truncationMode(.middle).frame(maxWidth: 130)
+                                Button { model.removeDraftFile(url) } label: { Image(systemName: "xmark").font(.system(size: 8, weight: .bold)) }
+                                    .buttonStyle(.plain).foregroundColor(.gray).help("移除 \(url.lastPathComponent)")
+                            }.padding(.horizontal, 7).padding(.vertical, 4).background(Color.white.opacity(0.10)).cornerRadius(6)
+                        }
+                    }
+                }
+                Button { model.cancelDraft() } label: { Image(systemName: "xmark.circle.fill").font(.system(size: 15)) }
+                    .buttonStyle(.plain).foregroundColor(.gray).help("取消（Esc）").accessibilityLabel("取消")
+            }.frame(height: 24)
+            HStack(spacing: 6) {
+                ForEach([("claude", "Claude", Agent.claudeColor), ("codex", "Codex", Color(white: 0.85))], id: \.0) { kind, label, color in
+                    let selected = model.draftKind == kind
+                    Button { model.draftKind = kind } label: {
+                        Text(label).font(.system(size: 11, weight: .semibold)).foregroundColor(selected ? color : .gray)
+                            .padding(.horizontal, 10).padding(.vertical, 4)
+                            .background(color.opacity(selected ? 0.18 : 0.0001)).cornerRadius(6)
+                            .overlay(RoundedRectangle(cornerRadius: 6).stroke(color.opacity(selected ? 0.6 : 0.15), lineWidth: 1))
+                    }.buttonStyle(.plain).accessibilityLabel("送給 \(label)")
+                }
+                Spacer()
+                Text(adding ? "放開以加入" : "可繼續拖入檔案").font(.system(size: 10)).foregroundColor(adding ? .mint : .gray)
+            }
+            HStack(spacing: 8) {
+                TextField("輸入問題，Enter 送出；留空則只帶入檔案", text: $model.draftText)
+                    .textFieldStyle(.plain).font(.system(size: 13)).focused($typing)
+                    .onSubmit { model.sendDraft() }
+                    .padding(.horizontal, 10).padding(.vertical, 8)
+                    .background(Color.white.opacity(0.08)).cornerRadius(8)
+                Button { model.sendDraft() } label: { Image(systemName: "arrow.up.circle.fill").font(.system(size: 24)) }
+                    .buttonStyle(.plain).foregroundColor(model.draftKind == "claude" ? Agent.claudeColor : Color(white: 0.85))
+                    .help("送出").accessibilityLabel("送出")
+            }
+        }.padding(.horizontal, 20).padding(.top, 4).padding(.bottom, 14)
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.mint.opacity(adding ? 0.8 : 0), lineWidth: 1.5).padding(.horizontal, 10).padding(.bottom, 6))
+            .onExitCommand { model.cancelDraft() }
+            .onAppear { DispatchQueue.main.async { typing = true } }
+    }
+}
 struct DropTarget: View {
     @ObservedObject var model: Model
     let kind, label: String
@@ -486,7 +594,10 @@ struct UnevenRoundedRectangleCompat: Shape {
     }
 }
 class NotchPanel: NSPanel {
-    override var canBecomeKey: Bool { false }
+    /// Key only while composing, so the question field can take typing
+    /// without the notch ever activating the app or stealing focus otherwise.
+    var allowsKey = false
+    override var canBecomeKey: Bool { allowsKey }
     override var canBecomeMain: Bool { false }
     // A notch must remain flush with the physical screen edge, including while
     // animating. Standard window constraints can push it below the menu bar.
@@ -500,15 +611,12 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
     /// File drops are handled here rather than with SwiftUI's onDrop, whose
     /// platform drop views were all placed at the zone's origin, so only the
     /// left target ever received a drag. The zone is split down the middle.
-    var dropZoneActive: () -> Bool = { false }
+    var dropTarget: (_ x: CGFloat, _ fromTop: CGFloat, _ width: CGFloat) -> String? = { _, _, _ in nil }
     var dropHover: (String?) -> Void = { _ in }
     var dropPerform: (String, [URL]) -> Void = { _, _ in }
     private func dropKind(_ sender: NSDraggingInfo) -> String? {
-        guard dropZoneActive() else { return nil }
         let point = convert(sender.draggingLocation, from: nil)
-        let fromTop = isFlipped ? point.y : bounds.height - point.y
-        guard bounds.contains(point), fromTop <= dropZoneHeight else { return nil }
-        return point.x < bounds.midX ? "claude" : "codex"
+        return dropTarget(point.x, isFlipped ? point.y : bounds.height - point.y, bounds.width)
     }
     private func track(_ sender: NSDraggingInfo) -> NSDragOperation {
         let kind = dropKind(sender)
@@ -549,7 +657,7 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
         let hosting = NotchHostingView(rootView:Dashboard(model:model))
         hosting.sizingOptions = []
         hosting.registerForDraggedTypes([.fileURL])
-        hosting.dropZoneActive = { [weak self] in self?.model.dropActive == true && self?.model.launchingKind == nil }
+        hosting.dropTarget = { [weak self] x, fromTop, width in self?.model.dropTarget(x: x, fromTop: fromTop, width: width) }
         hosting.dropHover = { [weak self] kind in
             guard let self, self.model.dropHover != kind else { return }
             self.model.dropHover = kind
@@ -557,11 +665,18 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
         hosting.dropPerform = { [weak self] kind, urls in
             guard let self else { return }
             appendNotchLog("drop \(kind): \(urls.count) file URL(s)")
-            // Claim the drop now: the drag's mouse-up would otherwise dismiss
-            // the zone before the launch starts.
-            self.model.dropHover = nil
-            self.model.launchingKind = kind
-            self.model.launch(kind: kind, urls: urls)
+            self.model.stage(target: kind, urls: urls)
+        }
+        model.onComposeChange = { [weak self] composing in
+            guard let self else { return }
+            self.panel.allowsKey = composing
+            if composing {
+                self.panel.makeKey()
+            } else if self.panel.isKeyWindow, !self.navigationSuspended {
+                // Reordering is what actually hands key status back.
+                self.panel.orderOut(nil)
+                if self.wantsVisible { self.panel.orderFrontRegardless() }
+            }
         }
         panel.contentView=hosting
         model.onStatus = { [weak self] in self?.item.button?.title = self?.model.blocked ?? 0 > 0 ? " ◉ \(self?.model.blocked ?? 0)" : " ◉ \(self?.model.working ?? 0)" }
@@ -582,11 +697,11 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
                     self.panel.ignoresMouseEvents = true
                     return
                 }
-                if self.model.showsDropZone || self.model.toast != nil {
-                    // Receive the drag only over the visible zone; the rest of
-                    // the canvas must keep passing drops to the app underneath.
-                    self.panel.ignoresMouseEvents = !(self.model.showsDropZone && self.wantsVisible && self.panel.isVisible
-                        && self.targetFrame().contains(NSEvent.mouseLocation))
+                if self.model.showsDropZone || self.model.composing || self.model.toast != nil {
+                    // Take the pointer only over the visible zone or tray; the
+                    // rest of the canvas keeps passing events to the app underneath.
+                    self.panel.ignoresMouseEvents = !((self.model.showsDropZone || self.model.composing) && self.wantsVisible
+                        && self.panel.isVisible && self.targetFrame().contains(NSEvent.mouseLocation))
                     return
                 }
                 if self.needsPointerExit {
