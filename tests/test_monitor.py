@@ -303,3 +303,17 @@ class LaunchTests(unittest.TestCase):
         result, _, copied = self.run_agent('Trust this folder?\n› 1. Trust and continue\n', start_error='timed out waiting for agent startup')
         self.assertEqual((result['pasted'], result['copied'], result['startError']), (False, True, 'timed out waiting for agent startup'))
         self.assertEqual(copied, ['/repo/My\\ Notes.md '])
+    def test_folders_and_any_file_type_are_handed_over_as_paths(self):
+        calls = []
+        def call(args, timeout=None):
+            calls.append(args)
+            if args[0] == 'tab': return {'result': {'tab': {'tab_id': 'w1:t2', 'workspace_id': 'w1'}, 'root_pane': {'pane_id': 'w1:p3'}}}
+            return {'result': {'workspace': {'label': '~'}}}
+        with tempfile.TemporaryDirectory() as d, patch.object(m, 'call', side_effect=call):
+            folder = os.path.join(d, 'My Project'); os.mkdir(folder)
+            archive = os.path.join(d, 'data.zip'); Path(archive).write_bytes(b'PK\x03\x04')
+            # A dropped folder is the working directory itself; a file uses its parent.
+            self.assertEqual(os.path.realpath(m.launch_tab('codex', [folder])['cwd']), os.path.realpath(folder))
+            self.assertEqual(calls[0][calls[0].index('--label') + 1], 'My Project')
+            self.assertEqual(os.path.realpath(m.launch_tab('claude', [archive, folder])['cwd']), os.path.realpath(d))
+            self.assertEqual(m.pasted_paths([archive, folder]), '\x1b[200~' + archive + ' ' + folder.replace(' ', '\\ ') + ' \x1b[201~')

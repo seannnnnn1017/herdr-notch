@@ -120,7 +120,7 @@ flowchart TD
 
 ## 拖曳檔案開新 session
 
-1. 開始拖曳檔案（可多選、可拖資料夾），瀏海會半展開。
+1. 開始拖曳檔案，瀏海會半展開。任何檔案類型、資料夾、多選都可以：瀏海一律只交出路徑，圖片由 agent 自己轉成附件，其他類型就是路徑文字。
 2. 放到「新 Claude session」或「新 Codex session」上。
 3. 瀏海在本機 Herdr 的 `default` session 開一個以檔名命名的新分頁，工作目錄是檔案所在的 git repo 根目錄（不在 repo 裡就用檔案所在資料夾），並啟動 agent。
 4. Ghostty 裡的 Herdr 跳到新分頁；如果 Herdr 當時在看別台機器，會先用[跳轉原理](#跳轉原理)的方式切回 Local。
