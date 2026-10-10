@@ -1,7 +1,6 @@
 import AppKit
 import SwiftUI
 import QuartzCore
-import UniformTypeIdentifiers
 
 
 /// Expanded dashboard height; the agent list takes whatever quota rows leave.
@@ -71,6 +70,8 @@ func appendNotchLog(_ message: String) {
     /// A file drag is in progress somewhere on screen; the notch offers drop targets.
     @Published var dropActive = false
     @Published var launchingKind: String?
+    /// Drop target under the dragged file: "claude", "codex" or nil.
+    @Published var dropHover: String?
     @Published var toast: String?
     private var toastTask: Task<Void, Never>?
     var showsDropZone: Bool { dropActive || launchingKind != nil }
@@ -213,7 +214,7 @@ func appendNotchLog(_ message: String) {
             var handedOff = false
             var succeeded = false
             defer {
-                focusingID = nil; launchingKind = nil; dropActive = false
+                focusingID = nil; launchingKind = nil; dropActive = false; dropHover = nil
                 if handedOff { onNavigationEnd?(succeeded) }
             }
             let paths = urls.map(\.path)
@@ -460,9 +461,11 @@ struct DropTarget: View {
     @ObservedObject var model: Model
     let kind, label: String
     let color: Color
-    @State private var targeted = false
     var body: some View {
         let busy = model.launchingKind == kind
+        // The hosting view receives the drop and reports which half is under
+        // the pointer; SwiftUI's own drop destinations were misplaced here.
+        let targeted = model.dropHover == kind && model.launchingKind == nil
         HStack(spacing: 8) {
             if busy { ProgressView().controlSize(.small) } else { Image(systemName: "plus.circle.fill") }
             Text(busy ? "正在開啟 \(label)…" : "新 \(label) session").font(.system(size: 13, weight: .semibold))
@@ -472,32 +475,6 @@ struct DropTarget: View {
                 style: StrokeStyle(lineWidth: 1.5, dash: targeted ? [] : [5, 4])))
             .scaleEffect(targeted ? 1.02 : 1).animation(.easeOut(duration: 0.12), value: targeted)
             .opacity(model.launchingKind == nil || busy ? 1 : 0.4)
-            .onChange(of: targeted) { inside in appendNotchLog("drop target \(kind): \(inside ? "entered" : "left")") }
-            .onDrop(of: [UTType.fileURL], isTargeted: $targeted) { providers in
-                guard model.launchingKind == nil else {
-                    appendNotchLog("drop \(kind): ignored, \(model.launchingKind ?? "") is still opening")
-                    return false
-                }
-                // The drag pasteboard already holds the file URLs, for any
-                // file type or folder; item providers can fail to load them.
-                let dragged = NSPasteboard(name: .drag).readObjects(forClasses: [NSURL.self],
-                    options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
-                appendNotchLog("drop \(kind): \(dragged.count) file URL(s) on the drag pasteboard, \(providers.count) provider(s)")
-                // Claim the drop now: the drag's mouse-up would otherwise
-                // dismiss the zone before a provider fallback finishes.
-                model.launchingKind = kind
-                guard dragged.isEmpty else { model.launch(kind: kind, urls: dragged); return true }
-                var urls: [URL] = []
-                let group = DispatchGroup()
-                for provider in providers {
-                    group.enter()
-                    _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                        DispatchQueue.main.async { if let url, url.isFileURL { urls.append(url) }; group.leave() }
-                    }
-                }
-                group.notify(queue: .main) { model.launch(kind: kind, urls: urls) }
-                return true
-            }
     }
 }
 struct UnevenRoundedRectangleCompat: Shape {
@@ -519,6 +496,38 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
     // Dashboard buttons should accept a click while another app is active,
     // without making this nonactivating panel the key window.
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// File drops are handled here rather than with SwiftUI's onDrop, whose
+    /// platform drop views were all placed at the zone's origin, so only the
+    /// left target ever received a drag. The zone is split down the middle.
+    var dropZoneActive: () -> Bool = { false }
+    var dropHover: (String?) -> Void = { _ in }
+    var dropPerform: (String, [URL]) -> Void = { _, _ in }
+    private func dropKind(_ sender: NSDraggingInfo) -> String? {
+        guard dropZoneActive() else { return nil }
+        let point = convert(sender.draggingLocation, from: nil)
+        let fromTop = isFlipped ? point.y : bounds.height - point.y
+        guard bounds.contains(point), fromTop <= dropZoneHeight else { return nil }
+        return point.x < bounds.midX ? "claude" : "codex"
+    }
+    private func track(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let kind = dropKind(sender)
+        dropHover(kind)
+        return kind == nil ? [] : .copy
+    }
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { track(sender) }
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { track(sender) }
+    override func draggingExited(_ sender: NSDraggingInfo?) { dropHover(nil) }
+    override func draggingEnded(_ sender: NSDraggingInfo) { dropHover(nil) }
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { dropKind(sender) != nil }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let kind = dropKind(sender) else { return false }
+        // Any file type or folder: only its path is handed to the agent.
+        let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        dropPerform(kind, urls)
+        return true
+    }
 }
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     let model=Model()
@@ -539,6 +548,21 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
         panel.collectionBehavior=[.canJoinAllSpaces,.fullScreenAuxiliary]; panel.hidesOnDeactivate=false
         let hosting = NotchHostingView(rootView:Dashboard(model:model))
         hosting.sizingOptions = []
+        hosting.registerForDraggedTypes([.fileURL])
+        hosting.dropZoneActive = { [weak self] in self?.model.dropActive == true && self?.model.launchingKind == nil }
+        hosting.dropHover = { [weak self] kind in
+            guard let self, self.model.dropHover != kind else { return }
+            self.model.dropHover = kind
+        }
+        hosting.dropPerform = { [weak self] kind, urls in
+            guard let self else { return }
+            appendNotchLog("drop \(kind): \(urls.count) file URL(s)")
+            // Claim the drop now: the drag's mouse-up would otherwise dismiss
+            // the zone before the launch starts.
+            self.model.dropHover = nil
+            self.model.launchingKind = kind
+            self.model.launch(kind: kind, urls: urls)
+        }
         panel.contentView=hosting
         model.onStatus = { [weak self] in self?.item.button?.title = self?.model.blocked ?? 0 > 0 ? " ◉ \(self?.model.blocked ?? 0)" : " ◉ \(self?.model.working ?? 0)" }
         model.onNavigationBegin = { [weak self] in self?.beginNavigation() }
@@ -616,6 +640,7 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
             guard model.dropActive else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
                 guard let self, self.model.launchingKind == nil else { return }
+                self.model.dropHover = nil
                 withAnimation(.easeInOut(duration: 0.2)) { self.model.dropActive = false }
             }
         default: break

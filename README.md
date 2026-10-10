@@ -161,6 +161,7 @@ Resources/claude_statusline.py  Claude Code statusLine 包裝：記錄 rate_limi
 python3 -m unittest discover -s tests   # monitor.py 與 statusline 包裝：inventory、遠端逾時、focus、Claude 額度
 ./tests/check_navigation.sh             # 標題解析、terminal 選擇、模擬側欄逐格切換、最後使用排序
 python3 tests/check_lifecycle.py        # 點擊流程與瀏海收合／還原
+python3 tests/check_drop.py             # 以模擬拖曳驗證左右兩個放置區與放開後交出的路徑
 ```
 
 也可以直接看橋接層輸出：
