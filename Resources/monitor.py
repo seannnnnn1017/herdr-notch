@@ -184,6 +184,73 @@ def focus(machine_id, session, pane):
         raise RuntimeError('遠端連線設定已變更，請重新整理')
     return endpoint_api(['--machine', machine_id], ['agent', 'focus', pane], profile)['result']['agent']
 
+def launch_cwd(path):
+    """Work in the dropped file's repository, else its folder."""
+    base = path if os.path.isdir(path) else os.path.dirname(path)
+    try:
+        top = subprocess.run(['git', '-C', base, 'rev-parse', '--show-toplevel'], capture_output=True, text=True, timeout=3)
+        if top.returncode == 0 and top.stdout.strip(): return top.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired): pass
+    return base
+
+def pasted_paths(paths):
+    """What a terminal pastes when files are dropped on it: shell-escaped
+    paths, wrapped as one bracketed paste. An agent's startup dialog (folder
+    trust, update notice) ignores a paste, so it can never answer one."""
+    safe = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-+=:,@%')
+    escaped = [''.join(c if c in safe or ord(c) > 127 else '\\' + c for c in path) for path in paths]
+    return '\x1b[200~' + ' '.join(escaped) + ' \x1b[201~'
+
+def launch_tab(kind, paths):
+    """Open a focused tab in the local default session for a new agent."""
+    if kind not in AGENT_KINDS: raise RuntimeError('不支援的 agent：' + kind)
+    paths = [os.path.abspath(p) for p in paths]
+    missing = [p for p in paths if not os.path.exists(p)]
+    if not paths or missing: raise RuntimeError('找不到檔案：' + (missing[0] if missing else ''))
+    cwd = launch_cwd(paths[0])
+    label = (os.path.basename(paths[0].rstrip('/')) or 'drop')[:40]
+    created = call(['tab', 'create', '--cwd', cwd, '--label', label, '--focus'])['result']
+    workspace_id = created['tab']['workspace_id']
+    workspace = call(['workspace', 'get', workspace_id])['result']['workspace']
+    return dict(pane=created['root_pane']['pane_id'], tab=created['tab']['tab_id'], workspace=workspace.get('label', ''), cwd=cwd, label=label)
+
+def launch_agent(kind, pane, paths, start_timeout=8000):
+    """Start the agent in the new pane, then hand it the dropped paths."""
+    if kind not in AGENT_KINDS: raise RuntimeError('不支援的 agent：' + kind)
+    paths = [os.path.abspath(p) for p in paths]
+    name = 'notch-%s-%d' % (kind, int(time.time()) % 1000000)
+    error = None
+    try: call(['agent', 'start', name, '--kind', kind, '--pane', pane, '--timeout', str(start_timeout)], timeout=start_timeout / 1000 + 10)
+    except Exception as e: error = query_error(e)
+    # Herdr moves attached clients for agent focus; the tab may have been
+    # created while the client was still on another machine.
+    try: call(['agent', 'focus', pane])
+    except Exception: pass
+    pasted = False
+    try:
+        call(['pane', 'send-text', pane, pasted_paths(paths)])
+        time.sleep(0.6)
+        visible = subprocess.run([binary('herdr'), 'pane', 'read', pane, '--source', 'visible'], capture_output=True, text=True, timeout=5).stdout
+        # A wrapped long path may be split across rows; compare without
+        # whitespace. The agent may show the name escaped or resolved.
+        name = os.path.basename(paths[0].rstrip('/'))
+        escaped = pasted_paths([name])[len('\x1b[200~'):-len('\x1b[201~')]
+        screen = ''.join(visible.split())
+        pasted = any(''.join(form.split()) in screen for form in (name, escaped))
+    except Exception: pass
+    copied = False
+    if not pasted:
+        # A startup dialog swallowed the paste, or the agent is not up yet.
+        try:
+            plain = pasted_paths(paths)[len('\x1b[200~'):-len('\x1b[201~')]
+            subprocess.run(['pbcopy'], input=plain, text=True, timeout=3, check=True)
+            copied = True
+        except (OSError, subprocess.SubprocessError): pass
+    return dict(pasted=pasted, copied=copied, startError=error)
+
+def focus_tab(tab):
+    return call(['tab', 'focus', tab])['result']
+
 def navigation_plans(endpoints):
     rows = []
     for endpoint_id, session, snapshot in endpoints:
@@ -222,7 +289,7 @@ def codex_quota():
                 return message['result']
         raise RuntimeError('Quota request timed out')
     try:
-        rpc(1, 'initialize', {'clientInfo': {'name':'herdr_notch', 'title':'Herdr Notch', 'version':'0.3.0'}})
+        rpc(1, 'initialize', {'clientInfo': {'name':'herdr_notch', 'title':'Herdr Notch', 'version':'0.4.0'}})
         send({'method':'initialized','params':{}})
         result = rpc(2, 'account/rateLimits/read')
         buckets = result.get('rateLimitsByLimitId') or {'codex':result.get('rateLimits')}
@@ -285,6 +352,12 @@ if __name__=='__main__':
             sys.exit(0)
         elif len(sys.argv)>1 and sys.argv[1]=='quota':
             result=quota()
+        elif len(sys.argv)>2 and sys.argv[1] in ('launch-tab', 'launch-agent', 'focus-tab'):
+            try:
+                if sys.argv[1]=='launch-tab': result=launch_tab(sys.argv[2], sys.argv[3:])
+                elif sys.argv[1]=='launch-agent': result=launch_agent(sys.argv[2], sys.argv[3], sys.argv[4:])
+                else: result=dict(tab=focus_tab(sys.argv[2]))
+            except Exception as e: result=dict(error=query_error(e))
         elif len(sys.argv)>1 and sys.argv[1]=='focus':
             try: result=dict(agent=focus(sys.argv[2],sys.argv[3],sys.argv[4]))
             except Exception as e: result=dict(error=query_error(e))

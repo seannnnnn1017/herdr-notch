@@ -15,7 +15,7 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>Herdr Notch</string>
 <key>CFBundleExecutable</key><string>HerdrNotch</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.3.0</string>
+<key>CFBundleShortVersionString</key><string>0.4.0</string>
 <key>NSAppleEventsUsageDescription</key><string>在現有 Ghostty Herdr terminal 中切換指定 pane。</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>

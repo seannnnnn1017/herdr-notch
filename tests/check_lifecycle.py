@@ -26,6 +26,7 @@ stubs = r'''
 import Foundation
 import Combine
 func appendNotchLog(_ message: String) {}
+let expandedHeight: CGFloat = 600, dropZoneHeight: CGFloat = 152, toastHeight: CGFloat = 70
 enum Color {
     case orange, mint, cyan, gray
     init(red: Double, green: Double, blue: Double) { self = .orange }

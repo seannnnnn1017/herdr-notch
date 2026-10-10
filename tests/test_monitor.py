@@ -260,3 +260,46 @@ class StatuslineWrapperTests(unittest.TestCase):
     def test_invalid_input_still_runs_status_line(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(self.run_wrapper(d, 'not json', '--wrap', 'echo ok').stdout, 'ok\n')
+
+class LaunchTests(unittest.TestCase):
+    def test_paths_are_shell_escaped_inside_one_bracketed_paste(self):
+        self.assertEqual(m.pasted_paths(['/a/My File (1).md', '/tmp/圖.png']),
+                         '\x1b[200~/a/My\\ File\\ \\(1\\).md /tmp/圖.png \x1b[201~')
+    def test_tab_opens_focused_in_the_dropped_files_repository(self):
+        calls = []
+        def call(args, timeout=None):
+            calls.append(args)
+            if args[0] == 'tab': return {'result': {'tab': {'tab_id': 'w1:t2', 'workspace_id': 'w1'}, 'root_pane': {'pane_id': 'w1:p3'}}}
+            return {'result': {'workspace': {'label': 'shop'}}}
+        with tempfile.TemporaryDirectory() as d, patch.object(m, 'call', side_effect=call), patch.object(m, 'launch_cwd', return_value='/repo'):
+            path = os.path.join(d, 'note.md'); Path(path).write_text('x')
+            result = m.launch_tab('claude', [path])
+        self.assertEqual(calls[0], ['tab', 'create', '--cwd', '/repo', '--label', 'note.md', '--focus'])
+        self.assertEqual(result, {'pane': 'w1:p3', 'tab': 'w1:t2', 'workspace': 'shop', 'cwd': '/repo', 'label': 'note.md'})
+    def test_bad_kind_or_missing_file_never_reaches_herdr(self):
+        with patch.object(m, 'call') as call:
+            with self.assertRaises(RuntimeError): m.launch_tab('gemini', ['/tmp'])
+            with self.assertRaises(RuntimeError): m.launch_tab('codex', ['/nonexistent/file'])
+            with self.assertRaises(RuntimeError): m.launch_tab('codex', [])
+        call.assert_not_called()
+    def run_agent(self, visible, start_error=None):
+        calls, copied = [], []
+        def call(args, timeout=None):
+            calls.append(args)
+            if args[:2] == ['agent', 'start'] and start_error: raise RuntimeError(start_error)
+            return {'result': {}}
+        def run(command, **kwargs):
+            if command[0] == 'pbcopy': copied.append(kwargs['input'])
+            return subprocess.CompletedProcess(command, 0, stdout=visible, stderr='')
+        with patch.object(m, 'call', side_effect=call), patch.object(m.subprocess, 'run', side_effect=run), patch.object(m.time, 'sleep'):
+            result = m.launch_agent('codex', 'w1:p3', ['/repo/My Notes.md'])
+        return result, calls, copied
+    def test_paste_confirmed_on_screen_leaves_the_clipboard_alone(self):
+        result, calls, copied = self.run_agent('› /repo/My\\ Notes.md \n')
+        self.assertEqual((result['pasted'], result['copied'], copied), (True, False, []))
+        self.assertEqual([c[:2] for c in calls], [['agent', 'start'], ['agent', 'focus'], ['pane', 'send-text']])
+        self.assertTrue(calls[2][3].startswith('\x1b[200~') and calls[2][3].endswith('\x1b[201~'))
+    def test_paste_swallowed_by_a_startup_dialog_falls_back_to_the_clipboard(self):
+        result, _, copied = self.run_agent('Trust this folder?\n› 1. Trust and continue\n', start_error='timed out waiting for agent startup')
+        self.assertEqual((result['pasted'], result['copied'], result['startError']), (False, True, 'timed out waiting for agent startup'))
+        self.assertEqual(copied, ['/repo/My\\ Notes.md '])

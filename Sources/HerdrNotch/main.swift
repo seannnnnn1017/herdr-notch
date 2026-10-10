@@ -1,10 +1,14 @@
 import AppKit
 import SwiftUI
 import QuartzCore
+import UniformTypeIdentifiers
 
 
 /// Expanded dashboard height; the agent list takes whatever quota rows leave.
 let expandedHeight: CGFloat = 600
+/// Half-expanded heights: drop targets while a file is dragged, and a one-line notice.
+let dropZoneHeight: CGFloat = 152
+let toastHeight: CGFloat = 70
 
 func bridge(_ args: [String]) async -> Data? {
     await withCheckedContinuation { continuation in
@@ -64,6 +68,17 @@ func appendNotchLog(_ message: String) {
     @Published var focusingID: String?
     /// Machine whose sessions the list shows; nil shows every machine.
     @Published var machineFilter: String?
+    /// A file drag is in progress somewhere on screen; the notch offers drop targets.
+    @Published var dropActive = false
+    @Published var launchingKind: String?
+    @Published var toast: String?
+    private var toastTask: Task<Void, Never>?
+    var showsDropZone: Bool { dropActive || launchingKind != nil }
+    var panelSize: CGSize {
+        if showsDropZone { return CGSize(width: 480, height: dropZoneHeight) }
+        if toast != nil { return CGSize(width: 480, height: toastHeight) }
+        return expanded ? CGSize(width: 480, height: expandedHeight) : CGSize(width: compactWidth, height: 34)
+    }
     var visibleAgents: [Agent] { machineFilter.map { id in agents.filter { $0.machineId == id } } ?? agents }
     private var recent = RecentActivity(lastUsed: UserDefaults.standard.dictionary(forKey: "lastUsed") as? [String: Double] ?? [:])
     private func saveRecent() { UserDefaults.standard.set(recent.lastUsed, forKey: "lastUsed") }
@@ -153,15 +168,81 @@ func appendNotchLog(_ message: String) {
         let message: String
         var errorDescription: String? { message }
     }
+    /// One JSON object from the bridge; its `error` field becomes a failure.
+    private func bridgeReply(_ args: [String], context: String) async throws -> [String: Any] {
+        guard let data = await bridge(args),
+              let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw FocusFailure(message: "Herdr 沒有回應，請稍後重試")
+        }
+        if let error = result["error"] as? String { throw FocusFailure(message: context + "：" + error) }
+        return result
+    }
     /// Herdr's own API selects the exact workspace, tab and pane on the
     /// agent's server, and moves clients already viewing that server.
     private func apiFocus(_ agent: Agent) async throws {
-        guard let data = await bridge(["focus", agent.machineId, agent.session, agent.pane]),
-              let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw FocusFailure(message: "Herdr 沒有回應切換指令，請稍後重試")
+        _ = try await bridgeReply(["focus", agent.machineId, agent.session, agent.pane], context: "\(agent.machine) · \(agent.pane)")
+    }
+    func showToast(_ message: String) {
+        toastTask?.cancel()
+        withAnimation(.easeInOut(duration: 0.2)) { toast = message }
+        toastTask = Task {
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.2)) { toast = nil }
         }
-        if let error = result["error"] as? String {
-            throw FocusFailure(message: "\(agent.machine) · \(agent.pane)：\(error)")
+    }
+    /// Dropped files open a new agent in a fresh tab of the local Herdr
+    /// session, with their paths handed to it, and the client jumps there.
+    func launch(kind: String, urls: [URL]) {
+        let name = kind == "claude" ? "Claude" : "Codex"
+        guard focusingID == nil, !urls.isEmpty else { launchingKind = nil; dropActive = false; return }
+        guard let terminal = NSRunningApplication.runningApplications(withBundleIdentifier: "com.mitchellh.ghostty").first else {
+            launchingKind = nil; dropActive = false
+            showToast("找不到已開啟的 Ghostty／Herdr 視窗")
+            return
+        }
+        launchingKind = kind
+        focusingID = "launch"
+        Task {
+            var handedOff = false
+            var succeeded = false
+            defer {
+                focusingID = nil; launchingKind = nil; dropActive = false
+                if handedOff { onNavigationEnd?(succeeded) }
+            }
+            let paths = urls.map(\.path)
+            do {
+                let tab = try await bridgeReply(["launch-tab", kind] + paths, context: "無法開啟 \(name)")
+                guard let pane = tab["pane"] as? String, let tabID = tab["tab"] as? String else {
+                    throw FocusFailure(message: "Herdr 沒有回傳新分頁")
+                }
+                var agent = Agent(id: "local:default:" + pane, machineId: "local", machine: "Local", pane: pane, session: "default",
+                                  title: tab["label"] as? String ?? name, cwd: tab["cwd"] as? String ?? "", status: "unknown")
+                agent.workspace = tab["workspace"] as? String
+                agent.agent = kind
+                // The agent starts while Ghostty is brought over; a startup
+                // dialog must not hold the jump for the readiness timeout.
+                let started = Task { await bridge(["launch-agent", kind, pane] + paths) }
+                try await GhosttyNavigation.switchPane(
+                    agent: agent, machines: machines,
+                    knownTitles: agents.map(\.title) + machines.flatMap { $0.workspaces ?? [] } + [agent.workspace ?? ""],
+                    app: terminal,
+                    focusAPI: { _ = try await self.bridgeReply(["focus-tab", tabID], context: "Local · \(pane)") },
+                    handoff: { if !handedOff { handedOff = true; self.onNavigationBegin?() } },
+                    diagnostic: { appendNotchLog($0) }
+                )
+                succeeded = true
+                let outcome = await started.value.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+                let message: String
+                if outcome["pasted"] as? Bool == true { message = "已開啟 \(name)，檔案路徑已填入" }
+                else if outcome["copied"] as? Bool == true { message = "已開啟 \(name)；路徑已複製，處理完提示後按 ⌘V 貼上" }
+                else { message = "已開啟 \(name)，但檔案路徑未能填入" }
+                appendNotchLog("OK: " + message)
+                showToast(message)
+            } catch {
+                appendNotchLog("FAILED: " + error.localizedDescription)
+                showToast(error.localizedDescription)
+            }
         }
     }
     func focus(_ agent: Agent) {
@@ -240,7 +321,13 @@ struct Dashboard: View {
                 .contentShape(Rectangle())
                 .help("\(model.working) 個工作中，\(model.blocked) 個待回覆，\(model.agents.count) 個 sessions；移入展開")
             }.buttonStyle(.plain).accessibilityLabel("展開 Herdr 工作台")
-            if model.expanded {
+            if model.showsDropZone {
+                DropZone(model: model).transition(.opacity)
+            } else if let toast = model.toast {
+                Text(toast).font(.system(size: 11, weight: .medium)).foregroundColor(.mint)
+                    .lineLimit(2).multilineTextAlignment(.center).padding(.horizontal, 20)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity).transition(.opacity)
+            } else if model.expanded {
                 VStack(alignment: .leading, spacing: 14) {
                     HStack {
                         VStack(alignment: .leading, spacing: 3) { Text("HERDR").font(.system(size: 12, weight: .bold, design: .monospaced)).foregroundColor(.mint); Text("你的 Agent 工作台").font(.system(size: 21, weight: .semibold)) }
@@ -339,7 +426,7 @@ struct Dashboard: View {
                 }.padding(.horizontal,20).padding(.top,15).padding(.bottom,20)
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
-        }.frame(width: model.expanded ? 480 : model.compactWidth, height: model.expanded ? expandedHeight : 34, alignment: .top)
+        }.frame(width: model.panelSize.width, height: model.panelSize.height, alignment: .top)
             .background(Color.black).foregroundColor(.white)
             .clipShape(UnevenRoundedRectangleCompat())
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -347,6 +434,54 @@ struct Dashboard: View {
     }
     func badge(_ label:String,_ value:Int,_ color:Color) -> some View {
         HStack { Text(label).font(.system(size:10)); Spacer(); Text("\(value)").font(.system(size:16,weight:.semibold,design:.monospaced)) }.foregroundColor(color).padding(10).background(color.opacity(0.08)).cornerRadius(9)
+    }
+}
+/// Shown while a file is dragged anywhere: one target per agent kind.
+struct DropZone: View {
+    @ObservedObject var model: Model
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                DropTarget(model: model, kind: "claude", label: "Claude", color: Agent.claudeColor)
+                DropTarget(model: model, kind: "codex", label: "Codex", color: Color(white: 0.85))
+            }
+            Text(model.launchingKind == nil ? "把檔案拖到這裡，在本機 Herdr 開新 session" : "正在開啟新分頁並跳轉…")
+                .font(.system(size: 10)).foregroundColor(.gray)
+        }.padding(.horizontal, 20).padding(.top, 4).padding(.bottom, 14)
+    }
+}
+struct DropTarget: View {
+    @ObservedObject var model: Model
+    let kind, label: String
+    let color: Color
+    @State private var targeted = false
+    var body: some View {
+        let busy = model.launchingKind == kind
+        HStack(spacing: 8) {
+            if busy { ProgressView().controlSize(.small) } else { Image(systemName: "plus.circle.fill") }
+            Text(busy ? "正在開啟 \(label)…" : "新 \(label) session").font(.system(size: 13, weight: .semibold))
+        }.foregroundColor(color).frame(maxWidth: .infinity).frame(height: 72)
+            .background(color.opacity(targeted ? 0.28 : 0.10)).cornerRadius(12)
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(color.opacity(targeted ? 0.9 : 0.35),
+                style: StrokeStyle(lineWidth: 1.5, dash: targeted ? [] : [5, 4])))
+            .scaleEffect(targeted ? 1.02 : 1).animation(.easeOut(duration: 0.12), value: targeted)
+            .opacity(model.launchingKind == nil || busy ? 1 : 0.4)
+            .onDrop(of: [UTType.fileURL], isTargeted: $targeted) { providers in
+                guard model.launchingKind == nil else { return false }
+                // Claim the drop now: the drag's mouse-up would otherwise
+                // dismiss the zone before the file URLs finish loading.
+                model.launchingKind = kind
+                var urls: [URL] = []
+                let group = DispatchGroup()
+                for provider in providers {
+                    group.enter()
+                    _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                        DispatchQueue.main.async { if let url { urls.append(url) }; group.leave() }
+                    }
+                }
+                group.notify(queue: .main) { model.launch(kind: kind, urls: urls) }
+                return true
+            }
     }
 }
 struct UnevenRoundedRectangleCompat: Shape {
@@ -397,6 +532,7 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
         item.button?.sendAction(on:[.leftMouseUp,.rightMouseUp]); item.button?.toolTip="Herdr Notch — 滑鼠移到瀏海展開，右鍵選單"
         NotificationCenter.default.addObserver(self,selector:#selector(screenChanged),name:NSApplication.didChangeScreenParametersNotification,object:nil)
         position(); panel.orderFrontRegardless()
+        watchFileDrags()
         // Check the live window bounds so resizing the SwiftUI view cannot
         // generate a spurious hover exit. Keep it open while using its controls.
         hoverTimer=Timer.scheduledTimer(withTimeInterval:0.05,repeats:true) { [weak self] _ in
@@ -404,6 +540,13 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
                 guard let self else { return }
                 guard !self.navigationSuspended else {
                     self.panel.ignoresMouseEvents = true
+                    return
+                }
+                if self.model.showsDropZone || self.model.toast != nil {
+                    // Receive the drag only over the visible zone; the rest of
+                    // the canvas must keep passing drops to the app underneath.
+                    self.panel.ignoresMouseEvents = !(self.model.showsDropZone && self.wantsVisible && self.panel.isVisible
+                        && self.targetFrame().contains(NSEvent.mouseLocation))
                     return
                 }
                 if self.needsPointerExit {
@@ -433,6 +576,34 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
         poll=Timer.scheduledTimer(withTimeInterval:3,repeats:true) { [weak self] _ in Task { await self?.model.refresh() } }
         quotaTimer=Timer.scheduledTimer(withTimeInterval:60,repeats:true) { [weak self] _ in Task { await self?.model.refreshQuota() } }
     }
+    /// Finder and other apps own the drag, so watch it globally: the drag
+    /// pasteboard changes when a drag starts, and holds file URLs for a file drag.
+    private var dragBaseline = NSPasteboard(name: .drag).changeCount
+    func watchFileDrags() {
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
+            MainActor.assumeIsolated { self?.fileDrag(event) }
+        }
+    }
+    private func fileDrag(_ event: NSEvent) {
+        let board = NSPasteboard(name: .drag)
+        switch event.type {
+        case .leftMouseDown:
+            dragBaseline = board.changeCount
+        case .leftMouseDragged:
+            guard !model.dropActive, wantsVisible, !navigationSuspended, model.focusingID == nil,
+                  board.changeCount != dragBaseline,
+                  board.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) else { return }
+            withAnimation(.easeInOut(duration: 0.2)) { model.dropActive = true }
+        case .leftMouseUp:
+            dragBaseline = board.changeCount
+            guard model.dropActive else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                guard let self, self.model.launchingKind == nil else { return }
+                withAnimation(.easeInOut(duration: 0.2)) { self.model.dropActive = false }
+            }
+        default: break
+        }
+    }
     func beginNavigation() {
         expandedBeforeNavigation = model.expanded
         navigationSuspended = true
@@ -458,7 +629,7 @@ final class NotchHostingView<Content: View>: NSHostingView<Content> {
     }
     func targetFrame() -> NSRect {
         guard let screen=NSScreen.screens.first(where:{$0.safeAreaInsets.top>0}) ?? NSScreen.main else{return .zero}
-        let height:CGFloat=model.expanded ? expandedHeight : 34, width:CGFloat=model.expanded ? 480 : model.compactWidth
+        let height = model.panelSize.height, width = model.panelSize.width
         return NSRect(x:screen.frame.midX-width/2,y:screen.frame.maxY-height,width:width,height:height)
     }
     func position() {
