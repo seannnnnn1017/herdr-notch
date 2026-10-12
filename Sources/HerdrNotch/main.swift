@@ -130,9 +130,10 @@ func appendNotchLog(_ message: String) {
         }
         onStatus?()
     }
-    func refreshQuota() async {
+    /// `fresh` bypasses the bridge's short cache of Claude's usage report.
+    func refreshQuota(fresh: Bool = false) async {
         guard !fetchingQuota else { return }; fetchingQuota = true; defer { fetchingQuota = false }
-        if let data = await bridge(["quota"]), let result = try? JSONDecoder().decode(Quota.self, from: data) { quota = result }
+        if let data = await bridge(fresh ? ["quota", "fresh"] : ["quota"]), let result = try? JSONDecoder().decode(Quota.self, from: data) { quota = result }
         else {
             let now = Date().timeIntervalSince1970
             quota = Quota(providers: ["Codex", "Claude"].map {
@@ -169,7 +170,7 @@ func appendNotchLog(_ message: String) {
             // Wait for an existing automatic fetch rather than reporting a
             // refresh as complete while that fetch is still in flight.
             while polling || fetchingQuota || focusingID != nil { try? await Task.sleep(nanoseconds: 50_000_000) }
-            await refresh(); await refreshQuota()
+            await refresh(); await refreshQuota(fresh: true)
             refreshing = false
             let failed = !errors.isEmpty || quota?.providers.contains { $0.error != nil } != false
             report(failed ? "更新完成，部分資料無法取得" : "已更新最新狀態", failed: failed)

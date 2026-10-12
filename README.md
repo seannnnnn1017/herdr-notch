@@ -34,7 +34,7 @@
 - **拖檔案提問**：從 Finder 或任何 app 拖檔案時，瀏海半展開成「Claude／Codex」兩個放置區。放開後檔案暫存在瀏海，可以繼續拖入更多檔案、切換 agent、輸入問題；送出後在本機 Herdr 開新分頁啟動該 agent、帶著問題與檔案直接開始回答，並跳到那個 pane（見[拖曳檔案開新 session](#拖曳檔案開新-session)）。
 - **一鍵跳轉**：點任一列，Ghostty 裡的 Herdr 就會切到那個 agent 的 pane，即使它在另一台機器上（見[跳轉原理](#跳轉原理)）。
 - **Codex 額度**：每 60 秒透過 `codex app-server` 讀取帳號剩餘額度與重置時間，用短暫的唯讀 process，不建立對話、不呼叫模型。
-- **Claude 額度**：顯示 Claude 訂閱的 5 小時與 7 天用量上限（以及 gateway 的花費上限），資料來自 Claude Code 官方 statusLine 提供的 `rate_limits`，不讀取登入憑證、不呼叫任何 API（見[啟用 Claude 額度](#啟用-claude-額度)）。
+- **Claude 額度**：顯示 Claude 訂閱的 5 小時與 7 天用量上限。由 Claude Code 自己的 `/usage` 指令回報（`claude -p /usage`），是帳號層級的數字，涵蓋 CLI、Claude 桌面 app 與其他裝置；這是本機指令，不呼叫模型、不花 token，瀏海也不讀取登入憑證（見[Claude 額度的來源](#claude-額度的來源)）。
 - **瀏海互動**：滑鼠移入展開，移出 0.2 秒後收合；透明區域不攔截點擊。沒有瀏海的螢幕會放在畫面頂部中央。右鍵選單列圖示可以隱藏或結束。
 
 ## 需求
@@ -75,51 +75,28 @@ previous_workspace = "ctrl+alt+p"
 
 另外請保留 Herdr 預設的視窗標題格式 `ui.window_title = "{hostname}: {workspace}"`，瀏海靠它判斷 Herdr 目前停在哪台機器。
 
-### 啟用 Claude 額度
+### Claude 額度的來源
 
-Claude Code 每次更新 status line 時，會把 session 資訊（含訂閱用量 `rate_limits`）以 JSON 傳給 `statusLine` 指令。Herdr Notch 附了一個包裝腳本：記下用量，再把同一份輸入原封不動交給你原本的 status line 指令，所以你看到的 status line 不會改變。
+不需要設定。瀏海每兩分鐘執行一次：
 
-App 啟動時會把腳本放到 `~/Library/Application Support/Herdr Notch/claude_statusline.py`。在 `~/.claude/settings.json` 設定：
+```sh
+claude -p /usage --output-format json --no-session-persistence
+```
 
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "python3 \"$HOME/Library/Application Support/Herdr Notch/claude_statusline.py\" --wrap 'bash ~/.claude/statusline.sh'"
+這是 Claude Code 內建的本機指令：不呼叫模型（0 token），回報的是整個帳號的用量，所以你在 Claude 桌面 app 或其他裝置用掉的額度也算在內。按瀏海的重新整理鈕會立刻重新讀取。
+
+- 只有 Claude 訂閱帳號（Pro／Max）會回報用量上限；使用 API key 時這一區會顯示沒有資料。
+- 舊版 Claude Code 若不把 `-p /usage` 當成本機指令，瀏海偵測到一次後就不再呼叫，避免把它當成問題送給模型。
+- **備援（選用）**：讀不到時，瀏海改用 Claude Code statusLine 提供的 `rate_limits`。這份紀錄只在終端機裡的 Claude Code 更新 status line 時才會刷新，所以只用桌面 app 的話會是舊值。要啟用，在 `~/.claude/settings.json` 用隨附的包裝腳本包住你原本的 status line 指令（app 啟動時會把腳本放到下列位置）：
+
+  ```json
+  {
+    "statusLine": {
+      "type": "command",
+      "command": "python3 \"$HOME/Library/Application Support/Herdr Notch/claude_statusline.py\" --wrap 'bash ~/.claude/statusline.sh'"
+    }
   }
-}
-```
-
-`--wrap` 後面放你原本的 status line 指令；沒有的話可以省略，腳本會顯示簡單的「模型 + context 用量」。Claude Code 下一次回應後，瀏海就會出現 Claude 額度。
-
-- `rate_limits` 只有 Claude 訂閱帳號（Pro／Max）才會提供；用 API key 的話這一區會保持空白。
-- 數值是最近一次任何 Claude Code session 回報的值，旁邊的時間就是回報時間；已過重置時間的視窗會自動隱藏。
-
-## 跳轉原理
-
-Herdr 的 `agent focus` API 能精準選定 pane，也會讓正在看那台機器的 client 跟著跳過去。但「client 正在看哪台機器」是 client 端的狀態，Herdr 沒有 API 可以改。所以只開一個 terminal 時，流程是這樣：
-
-```mermaid
-flowchart TD
-    A[點擊 agent] --> B[讀 Ghostty 視窗標題<br/>hostname: workspace]
-    B --> C{Herdr 已經在<br/>目標機器?}
-    C -- 是 --> F[herdr --machine X agent focus pane]
-    C -- 否 --> D[送一次 ctrl+alt+n / p]
-    D --> E{標題變了?}
-    E -- 變了，還沒到 --> D
-    E -- 到目標機器 --> F
-    E -- 沒變 --> G[到側欄盡頭：反向一次<br/>兩個方向都沒反應就停止]
-    G --> D
-    F --> H[標題確認後完成]
-```
-
-- **不讀畫面、不需要「輔助使用」權限**：只讀 Ghostty 的視窗標題（AppleScript），按鍵透過 Ghostty 的 `text:` action 送給指定的 terminal，不經過鍵盤與輸入法。
-- **每次只按一下**：等標題變了才按下一次，遠端機器切換較慢也不會多按。Herdr 側欄不會繞回開頭，走到盡頭就反向一次。
-- **安全閥**：設定檔沒有綁定那兩個快捷鍵、讀不到標題、或兩個方向都按不動時，都會停下來，不會把按鍵亂送進 agent 的輸入框。
-- **辨識機器**：本機看 hostname；遠端看 workspace 名稱，名稱唯一就能辨識，切換成功後也會記住各機器的 hostname。
-- 斷線中的機器，標題會顯示成單純的 `herdr`，這時無法跳轉，瀏海會顯示錯誤，其他機器不受影響。
-
-每一步都記錄在 `~/Library/Logs/Herdr Notch.log`（不含終端畫面內容），方便排查。
+  ```
 
 ## 拖曳檔案開新 session
 
@@ -145,7 +122,7 @@ flowchart TD
 ## 限制
 
 - 只列出跑在 Herdr 裡的 Codex 與 Claude Code；不在 Herdr 裡的 terminal、Codex 桌面 app、Claude 桌面 app 的對話不會顯示。
-- 額度是這台 Mac 上 Codex CLI／Claude Code 登入帳號的額度；遠端機器若用其他帳號，額度可能不同。Claude 額度只來自本機的 Claude Code sessions。
+- 額度是這台 Mac 上 Codex CLI／Claude Code 登入帳號的額度；遠端機器若用其他帳號，額度可能不同。Claude 額度是帳號層級的。
 - 本機只支援跳到 `default` session（Herdr client 預設連線的 session）。
 - 不會自動核准或替你送出任何 prompt。
 

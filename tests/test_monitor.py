@@ -229,12 +229,60 @@ class ClaudeUsageTests(unittest.TestCase):
                 'five_hour': {'used_percentage': 23.5, 'resets_at': 90},
                 'seven_day': {'used_percentage': 61, 'resets_at': 500},
                 'spend_limit': {'used_percentage': 120, 'resets_at': 900, 'period': 'weekly'}}})
-            result = m.claude_usage(now=100)
+            result = m.claude_usage_recorded(now=100)
         self.assertEqual([(w['label'], w['remaining']) for w in result['windows']], [('7 天', 39), ('花費上限 每週', 0)])
         self.assertEqual(result['updated'], 50)
-    def test_missing_record_explains_setup(self):
+    def test_missing_record_is_an_error(self):
         with tempfile.TemporaryDirectory() as d, patch.object(m, 'STATE', Path(d)):
-            with self.assertRaisesRegex(RuntimeError, 'statusLine'): m.claude_usage()
+            with self.assertRaises(RuntimeError): m.claude_usage_recorded()
+    REPORT = ('You are currently using your subscription to power your Claude Code usage\n\n'
+              'Current session: 75% used · resets Oct 12 at 4:10pm (Asia/Taipei)\n'
+              'Current week (all models): 47% used · resets Oct 16 at 4pm (Asia/Taipei)\n'
+              'Current week (Opus): 101.5% used\n\n'
+              "What's contributing to your limits usage?\n  100% of your usage was at >150k context\n")
+    NOW = 1791787176  # 2026-10-12 14:39:36 +08:00
+    def test_usage_report_lines_become_windows(self):
+        windows = m.usage_windows(self.REPORT, self.NOW)
+        self.assertEqual([(w['label'], w['remaining']) for w in windows], [('5 小時', 25), ('7 天', 53), ('7 天 · Opus', 0)])
+        self.assertEqual(windows[0]['resetsAt'] - self.NOW, 90 * 60 + 24)     # today 16:10 Taipei
+        self.assertEqual(windows[1]['resetsAt'], windows[0]['resetsAt'] + 4 * 86400 - 600)
+        self.assertIsNone(windows[2]['resetsAt'])
+    def test_reset_without_a_date_or_year_means_the_next_occurrence(self):
+        self.assertEqual(m.parse_reset('4:10pm (Asia/Taipei)', self.NOW) - self.NOW, 90 * 60 + 24)
+        self.assertEqual(m.parse_reset('2pm (Asia/Taipei)', self.NOW) - self.NOW, 86400 - 39 * 60 - 36)
+        january = m.parse_reset('Jan 2 at 9am (Asia/Taipei)', self.NOW)
+        self.assertTrue(80 * 86400 < january - self.NOW < 83 * 86400)
+        self.assertIsNone(m.parse_reset('sometime soon', self.NOW))
+    def live(self, reply, directory, **kwargs):
+        with patch.object(m, 'STATE', Path(directory)), patch.object(m, 'run_json', return_value=reply) as run:
+            try: return m.claude_usage_live(now=self.NOW, **kwargs), run
+            except RuntimeError as error: return error, run
+    def test_live_usage_runs_the_local_command_once_then_serves_its_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            result, run = self.live({'local_command': 'usage', 'result': self.REPORT}, d)
+            self.assertEqual(len(result['windows']), 3)
+            command = run.call_args[0][0]
+            self.assertEqual(command[1:], ['-p', '/usage', '--output-format', 'json', '--no-session-persistence'])
+            cached, again = self.live({'local_command': 'usage', 'result': ''}, d)
+            self.assertEqual(cached['windows'], result['windows']); again.assert_not_called()
+            forced, third = self.live({'local_command': 'usage', 'result': self.REPORT}, d, fresh=True)
+            third.assert_called_once()
+    def test_a_cli_that_would_send_usage_to_the_model_is_never_asked_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            error, _ = self.live({'result': 'Here is how usage works...'}, d)
+            self.assertIsInstance(error, RuntimeError)
+            error, run = self.live({'local_command': 'usage', 'result': self.REPORT}, d, fresh=True)
+            self.assertIsInstance(error, RuntimeError); run.assert_not_called()
+    def test_report_without_limits_is_an_error_not_an_empty_success(self):
+        with tempfile.TemporaryDirectory() as d:
+            error, _ = self.live({'local_command': 'usage', 'result': 'You are using an API key.'}, d)
+            self.assertIsInstance(error, RuntimeError)
+    def test_statusline_record_is_the_fallback_when_live_usage_fails(self):
+        with patch.object(m, 'claude_usage_live', side_effect=RuntimeError('找不到 claude')):
+            with patch.object(m, 'claude_usage_recorded', return_value={'windows': [], 'updated': 5}):
+                self.assertEqual(m.claude_usage()['updated'], 5)
+            with patch.object(m, 'claude_usage_recorded', side_effect=RuntimeError('尚未取得 Claude 用量')):
+                with self.assertRaisesRegex(RuntimeError, '找不到 claude'): m.claude_usage()
     def test_quota_reports_each_provider_independently(self):
         with patch.object(m, 'codex_quota', side_effect=RuntimeError('Codex server exited')), \
              patch.object(m, 'claude_usage', return_value={'windows': [], 'updated': 7}):

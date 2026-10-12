@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Read-only Herdr inventory and Codex / Claude usage bridge. No inference calls."""
-import json, os, sys, shutil, subprocess, threading, queue, time, signal, base64, ntpath
+import json, os, re, sys, shutil, subprocess, threading, queue, time, signal, base64, ntpath
+from datetime import datetime, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -24,10 +25,11 @@ def call(args, timeout=None):
     timeout = timeout if timeout is not None else (15 if '--machine' in args else 8)
     return run_json([binary('herdr')] + args, timeout)
 
-def run_json(command, timeout):
+def run_json(command, timeout, cwd=None):
     # Own a new process group so timeout cleanup touches only this query,
     # including its SSH child, never the existing client/server or SSH master.
-    p = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try: p = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, start_new_session=True, cwd=cwd)
+    except FileNotFoundError: raise RuntimeError('找不到 ' + os.path.basename(command[0])) from None
     try:
         stdout, stderr = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -329,14 +331,89 @@ def codex_quota():
 def window_label(minutes):
     return str(minutes//1440)+' 天' if minutes>=1440 else str(minutes//60)+' 小時' if minutes>=60 else str(minutes)+' 分鐘'
 
-def claude_usage(now=None):
+USAGE_LINE = re.compile(r'^\s*(.+?):\s*(\d+(?:\.\d+)?)%\s*used(?:\s*·\s*resets\s+(.+?))?\s*$')
+RESET_TIME = re.compile(r'^(?:([A-Za-z]{3})[a-z]*\s+(\d{1,2})(?:,?\s+at)?\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)(?:\s*\(([^)]+)\))?$', re.I)
+MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+
+def parse_reset(text, now):
+    """'Oct 12 at 4:09pm (Asia/Taipei)' -> epoch seconds of the next such time."""
+    match = RESET_TIME.match((text or '').strip())
+    if not match: return None
+    month, day, hour, minute, half, zone = match.groups()
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(zone) if zone else None
+    except Exception: tz = None
+    current = datetime.fromtimestamp(now, tz).astimezone(tz)
+    hour = int(hour) % 12 + (12 if half.lower() == 'pm' else 0)
+    try:
+        if month:
+            if month.lower() not in MONTHS: return None
+            candidate = current.replace(month=MONTHS.index(month.lower()) + 1, day=int(day), hour=hour, minute=int(minute or 0), second=0, microsecond=0)
+            # No year is printed: a date well in the past means next year.
+            if candidate < current - timedelta(days=30): candidate = candidate.replace(year=candidate.year + 1)
+        else:
+            candidate = current.replace(hour=hour, minute=int(minute or 0), second=0, microsecond=0)
+            if candidate < current: candidate += timedelta(days=1)
+    except ValueError: return None
+    return candidate.timestamp()
+
+def usage_windows(text, now):
+    """Windows from Claude Code's /usage report, e.g.
+    'Current session: 75% used · resets Oct 12 at 4:10pm (Asia/Taipei)'."""
+    windows = []
+    for line in text.splitlines():
+        match = USAGE_LINE.match(line)
+        if not match: continue
+        name, used, reset = match.groups()
+        scope = re.search(r'\(([^)]+)\)', name)
+        if name.lower().startswith('current session'): label = '5 小時'
+        elif name.lower().startswith('current week'):
+            label = '7 天' if not scope or scope.group(1).lower() == 'all models' else '7 天 · ' + scope.group(1)
+        else: label = name
+        windows.append(dict(id='claude-%d' % len(windows), label=label, remaining=max(0, min(100, 100-float(used))), resetsAt=parse_reset(reset, now), plan=None))
+    return windows
+
+def claude_usage_live(now=None, max_age=120, fresh=False):
+    """Account-wide limits from `claude -p /usage`: a local command, so no
+    model call and no tokens, and it covers the desktop app and other
+    devices, which the statusLine record cannot see."""
+    now = now or time.time()
+    STATE.mkdir(parents=True, exist_ok=True)
+    cache, disabled = STATE / 'claude-usage-live.json', STATE / 'claude-usage-live.disabled'
+    if not fresh:
+        try:
+            cached = json.loads(cache.read_text())
+            if 0 <= now - cached['updated'] < max_age: return cached
+        except (OSError, ValueError, KeyError, TypeError): pass
+    if disabled.exists(): raise RuntimeError('這個版本的 Claude Code 不支援離線查詢用量')
+    # Empty transcripts are not written with --no-session-persistence.
+    reply = run_json([binary('claude'), '-p', '/usage', '--output-format', 'json', '--no-session-persistence'], 25, cwd=str(STATE))
+    if reply.get('local_command') != 'usage':
+        # An older CLI would send "/usage" to the model. Never repeat that.
+        disabled.write_text('claude -p /usage was not handled as a local command\n')
+        raise RuntimeError('這個版本的 Claude Code 不支援離線查詢用量')
+    windows = usage_windows(reply.get('result') or '', now)
+    if not windows: raise RuntimeError('Claude Code 沒有回報訂閱用量（可能不是訂閱帳號）')
+    result = dict(windows=windows, updated=now)
+    cache.write_text(json.dumps(result, ensure_ascii=False))
+    return result
+
+def claude_usage(now=None, fresh=False):
+    """Prefer the live account-wide report; fall back to the last statusLine record."""
+    try: return claude_usage_live(now, fresh=fresh)
+    except Exception as live_error:
+        try: return claude_usage_recorded(now)
+        except Exception: raise RuntimeError(query_error(live_error)) from None
+
+def claude_usage_recorded(now=None):
     """Latest Claude subscription limits recorded by claude_statusline.py."""
     now = now or time.time()
     path = STATE / 'claude-usage.json'
     try:
         data = json.loads(path.read_text())
     except FileNotFoundError:
-        raise RuntimeError('尚未取得：請設定 Claude Code statusLine（見 README），回應一次後就會出現') from None
+        raise RuntimeError('尚未取得 Claude 用量') from None
     except (OSError, ValueError):
         raise RuntimeError('Claude 額度紀錄無法讀取') from None
     limits = data.get('rate_limits') or {}
@@ -360,8 +437,8 @@ def provider(id, label, read):
     except Exception as e:
         return dict(id=id, label=label, windows=[], updated=time.time(), error=query_error(e))
 
-def quota():
-    return dict(providers=[provider('codex', 'Codex', codex_quota), provider('claude', 'Claude', claude_usage)], updated=time.time())
+def quota(fresh=False):
+    return dict(providers=[provider('codex', 'Codex', codex_quota), provider('claude', 'Claude', lambda: claude_usage(fresh=fresh))], updated=time.time())
 
 if __name__=='__main__':
     try:
@@ -369,7 +446,7 @@ if __name__=='__main__':
             stream_inventory()
             sys.exit(0)
         elif len(sys.argv)>1 and sys.argv[1]=='quota':
-            result=quota()
+            result=quota(fresh=len(sys.argv)>2 and sys.argv[2]=='fresh')
         elif len(sys.argv)>2 and sys.argv[1] in ('launch-tab', 'launch-agent', 'focus-tab'):
             try:
                 if sys.argv[1]=='launch-tab': result=launch_tab(sys.argv[2], sys.argv[3:])
